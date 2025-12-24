@@ -160,46 +160,91 @@ class Transforms:
 
 
 class MEGDataset(Dataset):
+    """MEG Dataset.
+
+    Each __getitem__ returns:
+        [view0, view1, ..., viewN]
+    where each view is a (C, L) tensor.
+
+    Parameters
+    ----------
+    files : list[str]
+        Paths to .npy files of shape (C, T)
+    window_length : int
+        Length of each window in samples
+    stride : int
+        Stride between consecutive windows
+    crop_lengths : list[int]
+        Global crop lengths (DINO-style)
+    n_local_crops : int
+        Number of local crops
+    weak_transform, strong_transform
+        Same as before
+    """
     def __init__(
         self,
-        file_list,
+        files,
+        window_length,
+        stride,
         crop_lengths,
         n_local_crops=2,
         weak_transform=None,
         strong_transform=None,
     ):
-        self.files = file_list
-        self.crop_lengths = crop_lengths
-        self.n_local_crops = n_local_crops
+        self.files = files
+        self.window_length = int(window_length)
+        self.stride = int(stride)
+        self.crop_lengths = list(crop_lengths)
+        self.n_local_crops = int(n_local_crops)
         self.weak_transform = weak_transform
         self.strong_transform = strong_transform
 
-    def __len__(self):
-        return len(self.files)
+        # load data into memory (recommended)
+        self.data = [np.load(f) for f in self.files]
 
-    def random_crop(self, arr, L):
+        # precompute window indices: (file_id, start)
+        self.windows = []
+        for file_id, arr in enumerate(self.data):
+            C, T = arr.shape
+            if T < self.window_length:
+                # pad-short recordings to one window
+                self.windows.append((file_id, 0))
+            else:
+                starts = list(range(0, T - self.window_length + 1, self.stride))
+                for s in starts:
+                    self.windows.append((file_id, s))
+
+    def __len__(self):
+        return len(self.windows)
+
+    def _random_crop(self, arr, L):
         _, T = arr.shape
         if T <= L:
             pad = L - T
-            arr = np.pad(arr, ((0, 0), (0, pad)), mode="constant")
+            arr = np.pad(arr, ((0,0),(0,pad)), mode="constant")
             return arr[:, :L].astype(np.float32)
         start = random.randint(0, T - L)
-        return arr[:, start : start + L].astype(np.float32)
+        return arr[:, start:start+L].astype(np.float32)
 
     def __getitem__(self, idx):
-        arr = np.load(self.files[idx])  # (C, T)
+        file_id, start = self.windows[idx]
+        arr = self.data[file_id][:, start:start + self.window_length]  # (C, window_length)
+
         views = []
+
         # global crops (weak)
         for L in self.crop_lengths:
-            crop = self.random_crop(arr, L)
+            crop = self._random_crop(arr, L)
             if self.weak_transform:
                 crop = self.weak_transform(crop)
-            views.append(crop)
+            views.append(torch.from_numpy(crop).float())
+
         # local crops (strong)
         smallest = self.crop_lengths[-1]
         for _ in range(self.n_local_crops):
-            crop = self.random_crop(arr, smallest)
+            crop = self._random_crop(arr, smallest)
             if self.strong_transform:
                 crop = self.strong_transform(crop)
-            views.append(crop)
-        return [torch.from_numpy(v).float() for v in views]
+            views.append(torch.from_numpy(crop).float())
+
+        return views

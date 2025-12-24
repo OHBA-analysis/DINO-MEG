@@ -140,8 +140,6 @@ def train_one_epoch(
     device,
     step,
     grad_clip_norm,
-    log_every,
-    writer=None,
 ):
     """
     Runs one epoch of training and returns updated step and epoch_loss.
@@ -169,26 +167,6 @@ def train_one_epoch(
 
         # compute loss
         loss = loss_obj.loss(student_outputs, teacher_outputs, global_teacher_view_idxs)
-
-        # --- diagnostics: per-step (fast) ---
-        with torch.no_grad():
-            student_norms = [s.norm(dim=1).mean().item() for s in student_outputs]
-            teacher_norms = [t.norm(dim=1).mean().item() for t in teacher_outputs]
-            center_norm = loss_obj.registered_center.norm().item()
-
-        # print / log every log_every
-        if (it + 1) % log_every == 0:
-            print(
-                f"[it {it+1:4d}/{n_iter}] step {step} loss {loss.item():.4f} center_norm {center_norm:.4e} "
-                f"student_norms {[round(x,3) for x in student_norms]} teacher_norms {[round(x,3) for x in teacher_norms]}"
-            )
-            if writer is not None:
-                writer.add_scalar("loss/train", loss.item(), step)
-                writer.add_scalar("center/norm", center_norm, step)
-                for i, sn in enumerate(student_norms):
-                    writer.add_scalar(f"student_norm/view{i+1}", sn, step)
-                for i, tn in enumerate(teacher_norms):
-                    writer.add_scalar(f"teacher_norm/view{i+1}", tn, step)
 
         # backward with scaler
         opt.zero_grad()

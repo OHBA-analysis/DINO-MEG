@@ -19,10 +19,12 @@ from modules.trainer import (
 
 n_channels = 52
 sampling_frequency = 250
+window_length = 3000
+stride = window_length // 2
 crop_lengths = [1000, 500]
 n_local_crops = 2
 epochs = 10
-batch_size = 8
+batch_size = 4
 feat_dim = 512
 hidden_dim = 1024
 out_dim = 8192
@@ -40,7 +42,6 @@ teacher_temp = 0.04
 student_temp = 0.1
 center_momentum = 0.9
 grad_clip_norm = 1.0
-log_every = 1
 use_amp = True
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -94,6 +95,8 @@ strong_transform = Transforms(
 files = ["data/X.npy"]
 dataset = MEGDataset(
     files,
+    window_length=window_length,
+    stride=stride,
     crop_lengths=crop_lengths,
     n_local_crops=n_local_crops,
     weak_transform=weak_transform,
@@ -139,6 +142,10 @@ opt = torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
 
 n_iter_per_epoch = len(dl)
 total_steps = epochs * n_iter_per_epoch
+
+print("n_iter_per_epoch =", n_iter_per_epoch)
+print("total_steps =", total_steps)
+exit()
 
 lr_schedule = linear_warmup_cosine_decay(
     base_value=lr,
@@ -193,6 +200,5 @@ for epoch in range(epochs):
         device,
         step,
         grad_clip_norm,
-        log_every,
     )
     print(f"Epoch {epoch+1} finished, avg loss: {epoch_loss}")
