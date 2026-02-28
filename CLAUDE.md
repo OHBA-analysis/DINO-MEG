@@ -28,6 +28,8 @@ modules/          # Shared library
 
 exp_mnist/        # Sanity-check experiment on MNIST (2D conv)
   train.py
+  diagnose.py     # Post-hoc: confusion matrix, t-SNE, per-class accuracy
+  view_data.py    # Grid visualisation of raw samples
   data/           # Downloaded automatically
   checkpoints/
   figures/
@@ -46,7 +48,7 @@ New experiments follow the `exp_<name>/` pattern with their own `train.py`, `dat
 ## Architecture
 
 - **Backbone**: `ConvNet` — 3-layer Conv1d with BatchNorm + ReLU, AdaptiveAvgPool, Linear → `feat_dim`
-- **Projector**: 2-layer MLP → `out_dim` (typically 8192 for MEG, 4096 for MNIST)
+- **Projector**: 2-layer MLP → `out_dim` (8192 for MEG, 2048 for MNIST)
 - **DINOModel**: backbone + projector + optional predictor; output is L2-normalised
 - **Teacher**: EMA copy of student (no grad); momentum annealed 0.996 → 1.0
 

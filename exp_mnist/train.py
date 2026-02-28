@@ -10,7 +10,6 @@ torch.multiprocessing.set_sharing_strategy("file_system")
 
 import json
 import time
-import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torchvision import datasets, transforms
 from copy import deepcopy
@@ -39,22 +38,24 @@ epochs = 100
 batch_size = 512
 feat_dim = 256
 hidden_dim = 1024
-out_dim = 4096
+out_dim = 2048
 use_predictor = False
 lr = 5e-4
 lr_start = 1e-6
 lr_final_scale = 0.001
-warmup_epochs = 15
-weight_decay = 1e-6
+warmup_epochs = 5
+weight_decay = 0.04
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
 teacher_temp = 0.04
+teacher_temp_final = 0.07
+teacher_temp_warmup_epochs = 30
 student_temp = 0.1
 center_momentum = 0.9
 grad_clip_norm = 1.0
-knn_every = 10
+knn_every = 5
 knn_k = 20
-save_every = 10
+save_every = 25
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -71,6 +72,7 @@ _global_crop = transforms.Compose([
     transforms.RandomResizedCrop(28, scale=(0.6, 1.0)),
     transforms.RandomRotation(15),
     transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
     transforms.ToTensor(),
     _normalize,
 ])
@@ -78,6 +80,7 @@ _local_crop = transforms.Compose([
     transforms.RandomResizedCrop(14, scale=(0.2, 0.4)),
     transforms.RandomRotation(15),
     transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
     transforms.ToTensor(),
     _normalize,
 ])
@@ -166,6 +169,15 @@ teacher_m_schedule = linear_warmup_cosine_decay(
     start_warmup_value=teacher_momentum,
 )
 
+teacher_temp_schedule = linear_warmup_cosine_decay(
+    base_value=teacher_temp_final,
+    final_value=teacher_temp_final,
+    epochs=epochs,
+    n_iter_per_epoch=n_iter_per_epoch,
+    warmup_epochs=teacher_temp_warmup_epochs,
+    start_warmup_value=teacher_temp,
+)
+
 # ----
 # Loss
 # ----
@@ -209,6 +221,7 @@ for epoch in pbar:
         device,
         step,
         grad_clip_norm,
+        teacher_temp_schedule=teacher_temp_schedule,
     )
     epoch_secs = time.time() - t0
     elapsed = time.time() - train_start

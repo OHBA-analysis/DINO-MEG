@@ -12,7 +12,6 @@ Run with:
 
 import os
 import sys
-import json
 
 import numpy as np
 import torch
@@ -42,7 +41,7 @@ print(f"Device: {device}")
 
 # ------------------------------------------------------------------ load model
 backbone = ConvNet2D(feat_dim=feat_dim).to(device)
-backbone.load_state_dict(torch.load(CKPT, map_location=device))
+backbone.load_state_dict(torch.load(CKPT, map_location=device, weights_only=True))
 backbone.eval()
 print("Backbone loaded.")
 
@@ -165,12 +164,17 @@ print(f"Saved {path}")
 # Show 4 MNIST digits with all 4 views side-by-side
 _global_crop = transforms.Compose([
     transforms.RandomResizedCrop(28, scale=(0.6, 1.0)),
-    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(15),
+    transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
     transforms.ToTensor(),
     transforms.Normalize((0.1307,), (0.3081,)),
 ])
 _local_crop = transforms.Compose([
-    transforms.RandomResizedCrop(14, scale=(0.2, 0.5)),
+    transforms.RandomResizedCrop(14, scale=(0.2, 0.4)),
+    transforms.RandomRotation(15),
+    transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
+    transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
     transforms.ToTensor(),
     transforms.Normalize((0.1307,), (0.3081,)),
 ])

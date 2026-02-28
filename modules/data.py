@@ -14,7 +14,7 @@ def _fft_notch(x, fs, freq, bandwidth=1.0):
     N = x.shape[-1]
     freqs = np.fft.rfftfreq(N, d=1.0 / fs)
     X = np.fft.rfft(x)
-    mask = ~((freqs >= (freq - bandwidth / 2.0)) & (freq <= (freq + bandwidth / 2.0)))
+    mask = ~((freqs >= (freq - bandwidth / 2.0)) & (freqs <= (freq + bandwidth / 2.0)))
     X = X * mask
     return np.fft.irfft(X, n=N)
 
@@ -275,7 +275,7 @@ class MEGDataset(Dataset):
             views.append(torch.from_numpy(crop).float())
 
         # local crops (strong)
-        smallest = self.crop_lengths[-1]
+        smallest = min(self.crop_lengths)
         for _ in range(self.n_local_crops):
             crop = self._random_crop(arr, smallest)
             if self.strong_transform:

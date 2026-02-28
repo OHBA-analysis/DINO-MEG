@@ -36,7 +36,7 @@ envs/
   torch.yml       # Conda environment spec
 ```
 
-New experiments follow the `exp_<name>/` pattern with their own `train.py`, `data/`, `checkpoints/`, and `checkpoints/metrics.json`.
+New experiments follow the `exp_<name>/` pattern with their own `train.py`, `data/`, `checkpoints/`, and `metrics.json`.
 
 ---
 
@@ -49,17 +49,11 @@ New experiments follow the `exp_<name>/` pattern with their own `train.py`, `dat
 
 ### Projection head (`Projector`)
 
-Matches the official DINO head:
+2-layer MLP:
 
 ```
-Linear(feat_dim → hidden_dim) → GELU
-Linear(hidden_dim → hidden_dim) → GELU
-Linear(hidden_dim → bottleneck_dim)
-L2 normalise
-weight_norm Linear(bottleneck_dim → out_dim, no bias)
+Linear(feat_dim → hidden_dim) → GELU → Linear(hidden_dim → out_dim)
 ```
-
-The weight-normalised final layer decouples the weight direction from its magnitude, preventing unbounded growth and the gradient spikes that arise without it. L2 normalisation before this layer ensures the model learns direction rather than scale.
 
 ### Student-teacher (`DINOModel`)
 
@@ -82,12 +76,12 @@ The center is updated each step as an EMA of teacher outputs (momentum 0.9).
 
 ### Schedules
 
-| Schedule | Shape |
-|---|---|
-| Learning rate | Linear warmup → cosine decay |
-| Weight decay | Cosine from `0.04` → `0.4` (decay params only) |
-| Teacher momentum | Cosine from `0.996` → `1.0` |
-| Teacher temperature | Linear warmup `0.04` → `0.07` over first 30 epochs |
+| Schedule | MNIST | HMM-MVN |
+|---|---|---|
+| Learning rate | Linear warmup → cosine decay | Linear warmup → cosine decay |
+| Weight decay | Fixed (`0.04`, decay params only) | Fixed (`0.01`, decay params only) |
+| Teacher momentum | Cosine from `0.996` → `1.0` | Cosine from `0.996` → `1.0` |
+| Teacher temperature | Linear warmup `0.04` → `0.07` over 30 epochs | Linear warmup `0.04` → `0.07` over 30 epochs |
 
 ### Key hyperparameters
 
@@ -96,14 +90,13 @@ The center is updated each step as an EMA of teacher outputs (momentum 0.9).
 | Backbone | ConvNet2D | ConvNet (52 ch) |
 | `feat_dim` | 256 | 512 |
 | `hidden_dim` | 1024 | 1024 |
-| `bottleneck_dim` | 256 | 256 |
-| `out_dim` | 4096 | 8192 |
+| `out_dim` | 2048 | 8192 |
 | Global crop size | 28 px | 1000 samples (4 s) |
 | Local crop size | 14 px | 500 samples (2 s) |
-| Local crops | 2 | 4 |
+| Local crops | 2 | 2 |
 | Batch size | 512 | 32 |
-| Grad clip norm | 3.0 | 3.0 |
-| AMP | disabled | enabled |
+| Grad clip norm | 1.0 | 1.0 |
+| AMP | enabled (on CUDA) | enabled (on CUDA) |
 
 ### Evaluation
 
@@ -125,6 +118,7 @@ Trains a DINO model on unlabelled MNIST images. Checks that the self-supervised 
 - `RandomResizedCrop` (global: 28 px / local: 14 px)
 - `RandomRotation(15°)`
 - `RandomAffine(shear=10, translate=0.1)` — mimics handwriting-style deformation
+- `GaussianBlur(kernel=3, σ=0.1–1.0)` with probability 0.5
 - Normalise
 
 **Diagnostics:**

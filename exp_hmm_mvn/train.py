@@ -47,10 +47,12 @@ lr = 1e-3
 lr_start = 1e-6
 lr_final_scale = 0.001
 warmup_epochs = 5
-weight_decay = 1e-6
+weight_decay = 0.01
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
 teacher_temp = 0.04
+teacher_temp_final = 0.07
+teacher_temp_warmup_epochs = 30
 student_temp = 0.1
 center_momentum = 0.9
 grad_clip_norm = 1.0
@@ -130,6 +132,18 @@ dl = DataLoader(
 
 print(f"  Windows: {len(dataset)}, steps/epoch: {len(dl)}")
 
+# Pre-load eval data for k-NN (avoids reloading from disk every eval epoch)
+print("Loading eval data for k-NN...")
+X_eval = np.load(os.path.join(DATA_DIR, "X_eval.npy"))
+Y_eval = np.load(os.path.join(DATA_DIR, "Y_eval.npy"))
+X_train_arr = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+Y_train_arr = np.load(os.path.join(DATA_DIR, "Y_train.npy"))
+
+knn_train_ds = MEGLabeledDataset(X_train_arr, Y_train_arr, window_length, stride)
+knn_eval_ds = MEGLabeledDataset(X_eval, Y_eval, window_length, stride)
+knn_train_dl = DataLoader(knn_train_ds, batch_size=128, shuffle=False, num_workers=4)
+knn_eval_dl = DataLoader(knn_eval_ds, batch_size=128, shuffle=False, num_workers=4)
+
 # -------------------------
 # Student and teacher model
 # -------------------------
@@ -174,6 +188,15 @@ teacher_m_schedule = linear_warmup_cosine_decay(
     start_warmup_value=teacher_momentum,
 )
 
+teacher_temp_schedule = linear_warmup_cosine_decay(
+    base_value=teacher_temp_final,
+    final_value=teacher_temp_final,
+    epochs=epochs,
+    n_iter_per_epoch=n_iter_per_epoch,
+    warmup_epochs=teacher_temp_warmup_epochs,
+    start_warmup_value=teacher_temp,
+)
+
 # ----
 # Loss
 # ----
@@ -215,6 +238,7 @@ for epoch in range(epochs):
         device,
         step,
         grad_clip_norm,
+        teacher_temp_schedule=teacher_temp_schedule,
     )
 
     row = {
@@ -225,16 +249,6 @@ for epoch in range(epochs):
     }
 
     if (epoch + 1) % knn_every == 0:
-        X_eval = np.load(os.path.join(DATA_DIR, "X_eval.npy"))
-        Y_eval = np.load(os.path.join(DATA_DIR, "Y_eval.npy"))
-        X_train_arr = np.load(os.path.join(DATA_DIR, "X_train.npy"))
-        Y_train_arr = np.load(os.path.join(DATA_DIR, "Y_train.npy"))
-
-        knn_train_ds = MEGLabeledDataset(X_train_arr, Y_train_arr, window_length, stride)
-        knn_eval_ds = MEGLabeledDataset(X_eval, Y_eval, window_length, stride)
-        knn_train_dl = DataLoader(knn_train_ds, batch_size=128, shuffle=False, num_workers=4)
-        knn_eval_dl = DataLoader(knn_eval_ds, batch_size=128, shuffle=False, num_workers=4)
-
         top1, top5 = knn_evaluate(student.backbone, knn_train_dl, knn_eval_dl, knn_k, device)
         row["knn_top1"] = top1
         row["knn_top5"] = top5

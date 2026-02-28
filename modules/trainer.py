@@ -20,20 +20,20 @@ class DINOLoss:
         self.registered_center = torch.zeros(1, out_dim).to(device)
         self.device = device
 
-    def loss(self, student_outputs, teacher_outputs, global_teacher_views):
+    def loss(self, student_outputs, teacher_outputs, global_teacher_views, teacher_temp=None):
+        teacher_temp = teacher_temp if teacher_temp is not None else self.teacher_temp
         t_outs = [t.detach() for t in teacher_outputs]
-        s_outs = [s for s in student_outputs]
 
         n_teacher = len(t_outs)
-        n_student = len(s_outs)
-        B = s_outs[0].shape[0]
-        out_dim = s_outs[0].shape[1]
+        n_student = len(student_outputs)
+        B = student_outputs[0].shape[0]
+        out_dim = student_outputs[0].shape[1]
 
         t_logits = torch.cat(t_outs, dim=0)
-        t_logits_centered = (t_logits - self.registered_center) / self.teacher_temp
+        t_logits_centered = (t_logits - self.registered_center) / teacher_temp
         t_probs = F.softmax(t_logits_centered, dim=1)
 
-        s_logits = torch.cat([s / self.student_temp for s in s_outs], dim=0)
+        s_logits = torch.cat([s / self.student_temp for s in student_outputs], dim=0)
         s_log_probs = F.log_softmax(s_logits, dim=1)
 
         total_loss = 0.0
@@ -116,8 +116,8 @@ def param_groups_lrd(model, weight_decay):
 
 def prepare_view_tensors(batch, device):
     """
-    batch: list of samples where each sample is list of view tensors (C, L)
-    returns: list of view tensors each shaped (B, C, L) on device
+    batch: list of samples where each sample is list of view tensors (C, ...).
+    returns: list of view tensors each shaped (B, C, ...) on device.
     """
     n_views = len(batch[0])
     view_tensors = []
@@ -168,9 +168,9 @@ def knn_evaluate(backbone, train_loader, val_loader, k, device):
             pred = counts.argmax().item()
             if pred == true_label:
                 correct_top1 += 1
-            # top-5: is true label among top-5 unique candidates?
-            unique_cands = neighbors.unique()[:5]
-            if true_label in unique_cands.tolist():
+            # top-5: is true label among top-5 most frequent candidates?
+            top5_labels = counts.topk(min(5, len(counts))).indices
+            if true_label in top5_labels.tolist():
                 correct_top5 += 1
         total += feats.shape[0]
 
@@ -193,6 +193,7 @@ def train_one_epoch(
     device,
     step,
     grad_clip_norm,
+    teacher_temp_schedule=None,
 ):
     """
     Runs one epoch of training and returns updated step, epoch_loss, mean_grad_norm,
@@ -203,24 +204,41 @@ def train_one_epoch(
     running_grad_norm = 0.0
     n_iter = len(dl)
     for it, batch in enumerate(dl):
+        # update lr for optimizer param groups (before step)
+        for pg in opt.param_groups:
+            pg["lr"] = lr_schedule[step]
+
         # prepare tensors per view
         view_tensors = prepare_view_tensors(batch, device)  # list of (B, C, L)
 
-        # forward student with AMP (global and local views)
-        student_outputs = []
+        # forward student with AMP — batch views with the same spatial size
+        student_outputs = [None] * len(view_tensors)
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-            for vt in view_tensors:
-                student_outputs.append(student(vt))
+            groups = {}
+            for i, vt in enumerate(view_tensors):
+                groups.setdefault(vt.shape[2:], []).append(i)
+            for indices in groups.values():
+                cat = torch.cat([view_tensors[i] for i in indices], dim=0)
+                out = student(cat)
+                for i, chunk in zip(indices, out.chunk(len(indices))):
+                    student_outputs[i] = chunk
 
-        # forward teacher (only global views)
-        teacher_outputs = []
+        # forward teacher (only global views) — batch same-size globals
+        teacher_outputs = [None] * len(global_teacher_view_idxs)
         with torch.no_grad():
             with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                for gi in global_teacher_view_idxs:
-                    teacher_outputs.append(teacher(view_tensors[gi]))
+                groups = {}
+                for j, gi in enumerate(global_teacher_view_idxs):
+                    groups.setdefault(view_tensors[gi].shape[2:], []).append(j)
+                for indices in groups.values():
+                    cat = torch.cat([view_tensors[global_teacher_view_idxs[j]] for j in indices], dim=0)
+                    out = teacher(cat)
+                    for j, chunk in zip(indices, out.chunk(len(indices))):
+                        teacher_outputs[j] = chunk
 
         # compute loss
-        loss = loss_obj.loss(student_outputs, teacher_outputs, global_teacher_view_idxs)
+        t_temp = teacher_temp_schedule[step] if teacher_temp_schedule is not None else None
+        loss = loss_obj.loss(student_outputs, teacher_outputs, global_teacher_view_idxs, teacher_temp=t_temp)
 
         # backward with scaler
         opt.zero_grad()
@@ -239,10 +257,6 @@ def train_one_epoch(
 
         # update DINO center
         loss_obj.update_center(teacher_outputs)
-
-        # update lr for optimizer param groups
-        for pg in opt.param_groups:
-            pg["lr"] = lr_schedule[step]
 
         running_loss += loss.item()
         running_grad_norm += grad_norm
