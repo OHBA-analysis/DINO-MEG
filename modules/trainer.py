@@ -195,11 +195,12 @@ def train_one_epoch(
     grad_clip_norm,
 ):
     """
-    Runs one epoch of training and returns updated step and epoch_loss.
-    Encapsulates forward, loss, diagnostics, backward, EMA update.
+    Runs one epoch of training and returns updated step, epoch_loss, mean_grad_norm,
+    and center_norm. Encapsulates forward, loss, diagnostics, backward, EMA update.
     """
     student.train()
     running_loss = 0.0
+    running_grad_norm = 0.0
     n_iter = len(dl)
     for it, batch in enumerate(dl):
         # prepare tensors per view
@@ -226,7 +227,9 @@ def train_one_epoch(
         scaler.scale(loss).backward()
         if grad_clip_norm > 0:
             scaler.unscale_(opt)
-            torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm)
+            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm).item()
+        else:
+            grad_norm = 0.0
         scaler.step(opt)
         scaler.update()
 
@@ -242,7 +245,10 @@ def train_one_epoch(
             pg["lr"] = lr_schedule[step]
 
         running_loss += loss.item()
+        running_grad_norm += grad_norm
         step += 1
 
     epoch_loss = running_loss / max(1, n_iter)
-    return step, epoch_loss
+    mean_grad_norm = running_grad_norm / max(1, n_iter)
+    center_norm = loss_obj.registered_center.norm().item()
+    return step, epoch_loss, mean_grad_norm, center_norm
