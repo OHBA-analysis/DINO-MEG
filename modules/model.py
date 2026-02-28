@@ -26,6 +26,28 @@ class ConvNet(nn.Module):
         return self.net(x)
 
 
+class ConvNet2D(nn.Module):
+    def __init__(self, feat_dim=256):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1),
+            nn.BatchNorm2d(32),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(64),
+            nn.ReLU(inplace=True),
+            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(128),
+            nn.ReLU(inplace=True),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Linear(128, feat_dim),
+        )
+
+    def forward(self, x):
+        return self.net(x)
+
+
 class Projector(nn.Module):
     def __init__(self, in_dim, hidden_dim=2048, out_dim=8192):
         super().__init__()

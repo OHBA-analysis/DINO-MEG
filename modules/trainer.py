@@ -127,6 +127,59 @@ def prepare_view_tensors(batch, device):
     return view_tensors
 
 
+@torch.no_grad()
+def knn_evaluate(backbone, train_loader, val_loader, k, device):
+    """k-NN evaluation using cosine similarity on backbone features.
+
+    Returns (top1_acc, top5_acc) as floats in [0, 1].
+    """
+    was_training = backbone.training
+    backbone.eval()
+
+    # collect train features and labels
+    train_feats, train_labels = [], []
+    for images, labels in train_loader:
+        images = images.to(device)
+        feats = backbone(images)
+        feats = F.normalize(feats, dim=1)
+        train_feats.append(feats.cpu())
+        train_labels.append(labels)
+    train_feats = torch.cat(train_feats, dim=0)    # (N_train, D)
+    train_labels = torch.cat(train_labels, dim=0)  # (N_train,)
+
+    # evaluate on val set
+    correct_top1 = 0
+    correct_top5 = 0
+    total = 0
+    for images, labels in val_loader:
+        images = images.to(device)
+        feats = backbone(images)
+        feats = F.normalize(feats, dim=1).cpu()    # (B, D)
+
+        sims = feats @ train_feats.t()             # (B, N_train)
+        topk_indices = sims.topk(k, dim=1).indices # (B, k)
+        topk_labels = train_labels[topk_indices]   # (B, k)
+
+        for i in range(feats.shape[0]):
+            true_label = labels[i].item()
+            neighbors = topk_labels[i]             # (k,)
+            # top-1: majority vote
+            counts = torch.bincount(neighbors)
+            pred = counts.argmax().item()
+            if pred == true_label:
+                correct_top1 += 1
+            # top-5: is true label among top-5 unique candidates?
+            unique_cands = neighbors.unique()[:5]
+            if true_label in unique_cands.tolist():
+                correct_top5 += 1
+        total += feats.shape[0]
+
+    backbone.train(was_training)
+    top1 = correct_top1 / total
+    top5 = correct_top5 / total
+    return top1, top5
+
+
 def train_one_epoch(
     student,
     teacher,

@@ -159,6 +159,41 @@ class Transforms:
         return out.astype(arr.dtype)
 
 
+class MEGLabeledDataset(Dataset):
+    """MEG dataset with labels, for k-NN evaluation.
+
+    Parameters
+    ----------
+    data : ndarray, shape (C, T)
+    labels : ndarray, shape (T,)
+    window_length : int
+    stride : int
+    """
+    def __init__(self, data, labels, window_length, stride):
+        self.data = data
+        self.labels = labels
+        self.window_length = int(window_length)
+        self.stride = int(stride)
+
+        C, T = data.shape
+        self.windows = []
+        if T < self.window_length:
+            self.windows.append(0)
+        else:
+            for s in range(0, T - self.window_length + 1, self.stride):
+                self.windows.append(s)
+
+    def __len__(self):
+        return len(self.windows)
+
+    def __getitem__(self, idx):
+        start = self.windows[idx]
+        window = self.data[:, start:start + self.window_length].astype(np.float32)
+        window_labels = self.labels[start:start + self.window_length]
+        majority_label = int(np.bincount(window_labels).argmax())
+        return torch.from_numpy(window), majority_label
+
+
 class MEGDataset(Dataset):
     """MEG Dataset.
 

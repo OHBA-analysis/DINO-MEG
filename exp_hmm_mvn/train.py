@@ -1,21 +1,29 @@
-"""Train DINO."""
+"""Train DINO on HMM-MVN simulated MEG data."""
 
+import os
+import sys
+import numpy as np
 import torch
 from torch.utils.data import DataLoader
 from copy import deepcopy
 
-from modules.data import Transforms, MEGDataset
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
+
+from modules.data import Transforms, MEGDataset, MEGLabeledDataset
 from modules.model import ConvNet, Projector, DINOModel
 from modules.trainer import (
     train_one_epoch,
     param_groups_lrd,
     linear_warmup_cosine_decay,
     DINOLoss,
+    knn_evaluate,
 )
 
 # ----------
 # Parameters
 # ----------
+
+DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 
 n_channels = 52
 sampling_frequency = 250
@@ -23,18 +31,16 @@ window_length = 3000
 stride = window_length // 2
 crop_lengths = [1000, 500]
 n_local_crops = 2
-epochs = 10
-batch_size = 4
+epochs = 100
+batch_size = 32
 feat_dim = 512
 hidden_dim = 1024
 out_dim = 8192
-predictor_hidden = 512
-predictor_out = None
 use_predictor = False
 lr = 1e-3
 lr_start = 1e-6
 lr_final_scale = 0.001
-warmup_epochs = 2
+warmup_epochs = 5
 weight_decay = 1e-6
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
@@ -42,7 +48,8 @@ teacher_temp = 0.04
 student_temp = 0.1
 center_momentum = 0.9
 grad_clip_norm = 1.0
-use_amp = True
+knn_every = 5
+knn_k = 20
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("Using device:", device)
@@ -92,7 +99,7 @@ strong_transform = Transforms(
     time_reverse_p=0.1,
 )
 
-files = ["data/X.npy"]
+files = [os.path.join(DATA_DIR, "X_train.npy")]
 dataset = MEGDataset(
     files,
     window_length=window_length,
@@ -118,18 +125,8 @@ dl = DataLoader(
 backbone = ConvNet(in_channels=n_channels, feat_dim=feat_dim)
 projector = Projector(in_dim=feat_dim, hidden_dim=hidden_dim, out_dim=out_dim)
 
-student = DINOModel(
-    backbone,
-    projector,
-    use_predictor=use_predictor,
-    predictor_kwargs={
-        "hidden_dim": predictor_hidden,
-        "out_dim": out_dim if predictor_out is None else predictor_out,
-    },
-).to(device)
+student = DINOModel(backbone, projector, use_predictor=use_predictor).to(device)
 teacher = deepcopy(student).to(device)
-
-# Don't need gradients for the teacher
 for p in teacher.parameters():
     p.requires_grad = False
 
@@ -142,10 +139,6 @@ opt = torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
 
 n_iter_per_epoch = len(dl)
 total_steps = epochs * n_iter_per_epoch
-
-print("n_iter_per_epoch =", n_iter_per_epoch)
-print("total_steps =", total_steps)
-exit()
 
 lr_schedule = linear_warmup_cosine_decay(
     base_value=lr,
@@ -169,7 +162,7 @@ teacher_m_schedule = linear_warmup_cosine_decay(
 # Loss
 # ----
 
-loss = DINOLoss(
+loss_obj = DINOLoss(
     out_dim=out_dim,
     teacher_temp=teacher_temp,
     student_temp=student_temp,
@@ -182,8 +175,7 @@ loss = DINOLoss(
 # --------
 
 scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
-
-global_teacher_view_idxs = list(range(len(crop_lengths)))  # teacher global view indices
+global_teacher_view_idxs = list(range(len(crop_lengths)))
 
 step = 0
 for epoch in range(epochs):
@@ -193,7 +185,7 @@ for epoch in range(epochs):
         dl,
         opt,
         scaler,
-        loss,
+        loss_obj,
         lr_schedule,
         teacher_m_schedule,
         global_teacher_view_idxs,
@@ -201,4 +193,22 @@ for epoch in range(epochs):
         step,
         grad_clip_norm,
     )
-    print(f"Epoch {epoch+1} finished, avg loss: {epoch_loss}")
+
+    if (epoch + 1) % knn_every == 0:
+        X_eval = np.load(os.path.join(DATA_DIR, "X_eval.npy"))
+        Y_eval = np.load(os.path.join(DATA_DIR, "Y_eval.npy"))
+        X_train_arr = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+        Y_train_arr = np.load(os.path.join(DATA_DIR, "Y_train.npy"))
+
+        knn_train_ds = MEGLabeledDataset(X_train_arr, Y_train_arr, window_length, stride)
+        knn_eval_ds = MEGLabeledDataset(X_eval, Y_eval, window_length, stride)
+        knn_train_dl = DataLoader(knn_train_ds, batch_size=128, shuffle=False, num_workers=4)
+        knn_eval_dl = DataLoader(knn_eval_ds, batch_size=128, shuffle=False, num_workers=4)
+
+        top1, top5 = knn_evaluate(student.backbone, knn_train_dl, knn_eval_dl, knn_k, device)
+        print(
+            f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f} "
+            f"| kNN top1 {top1*100:.1f}% top5 {top5*100:.1f}%"
+        )
+    else:
+        print(f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f}")
