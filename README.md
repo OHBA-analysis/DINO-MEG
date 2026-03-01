@@ -26,6 +26,7 @@ modules/
 exp_mnist/        # Sanity-check experiment on MNIST (2D conv)
   train.py
   diagnose.py     # Post-hoc: confusion matrix, t-SNE, per-class accuracy
+  analyse.py      # Deep analysis: GradCAM, PCA, NN retrieval, sub-clusters, probing
   view_data.py    # Grid visualisation of raw samples
 
 exp_hmm_mvn/      # Validation experiment on HMM-MVN simulated MEG (1D conv, 52 ch)
@@ -126,6 +127,17 @@ Trains a DINO model on unlabelled MNIST images. Checks that the self-supervised 
 python exp_mnist/diagnose.py   # confusion matrix, t-SNE, per-class accuracy
 python exp_mnist/view_data.py  # grid of raw samples
 ```
+
+**Representation analysis** (`analyse.py`) — 11 figures exploring the learned features:
+```bash
+python exp_mnist/analyse.py
+```
+- GradCAM saliency maps (per-class averages + individual examples)
+- PCA explained variance, extremes, and t-SNE coloured by PC values
+- Nearest-neighbor retrieval with same/different class borders
+- Intra-class sub-clusters via k-means in feature space
+- Inter-class cosine similarity heatmap and dendrogram
+- Feature probing: Ridge regression from features to visual properties (stroke thickness, aspect ratio, centre of mass, slant angle)
 
 ### HMM-MVN (MEG validation)
 
