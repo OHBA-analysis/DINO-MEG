@@ -1,4 +1,9 @@
-"""Train DINO on HMM-MVN simulated MEG data."""
+"""Train DINO on switching oscillatory burst simulated MEG data.
+
+The simulation generates transient narrowband bursts (theta, alpha, beta,
+low-gamma) riding on a 1/f pink noise background, switched by a Markov chain.
+See simulate_data.py for details of the signal model.
+"""
 
 import json
 import os
