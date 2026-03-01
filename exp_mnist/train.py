@@ -22,6 +22,7 @@ from modules.trainer import (
     linear_warmup_cosine_decay,
     DINOLoss,
     knn_evaluate,
+    linear_probe_evaluate,
 )
 
 # ----------
@@ -43,7 +44,7 @@ use_predictor = False
 lr = 5e-4
 lr_start = 1e-6
 lr_final_scale = 0.001
-warmup_epochs = 5
+warmup_epochs = 10
 weight_decay = 0.04
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
@@ -77,7 +78,7 @@ _global_crop = transforms.Compose([
     _normalize,
 ])
 _local_crop = transforms.Compose([
-    transforms.RandomResizedCrop(14, scale=(0.2, 0.4)),
+    transforms.RandomResizedCrop(20, scale=(0.4, 0.7)),
     transforms.RandomRotation(15),
     transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
@@ -85,9 +86,14 @@ _local_crop = transforms.Compose([
     _normalize,
 ])
 
+n_local_crops = 2
+
 
 class MNISTMultiView(Dataset):
-    """MNIST returning a list of 4 augmented views (no labels)."""
+    """MNIST returning a list of augmented views (no labels).
+
+    Views: 2 global (28x28) + n_local (20x20).
+    """
     def __init__(self, train):
         self._base = datasets.MNIST(DATA_DIR, train=train, download=True)
 
@@ -96,12 +102,10 @@ class MNISTMultiView(Dataset):
 
     def __getitem__(self, idx):
         img, _ = self._base[idx]
-        return [
-            _global_crop(img),
-            _global_crop(img),
-            _local_crop(img),
-            _local_crop(img),
-        ]
+        views = [_global_crop(img), _global_crop(img)]
+        for _ in range(n_local_crops):
+            views.append(_local_crop(img))
+        return views
 
 
 print("\nLoading data...")
@@ -110,7 +114,7 @@ dl = DataLoader(
     dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=16,
+    num_workers=12,
     pin_memory=True,
     persistent_workers=True,
     prefetch_factor=4,
@@ -123,15 +127,15 @@ print(f"  Train samples: {len(dataset)}, steps/epoch: {len(dl)}")
 _plain = transforms.Compose([transforms.ToTensor(), _normalize])
 knn_train_ds = datasets.MNIST(DATA_DIR, train=True, download=True, transform=_plain)
 knn_val_ds   = datasets.MNIST(DATA_DIR, train=False, download=True, transform=_plain)
-knn_train_dl = DataLoader(knn_train_ds, batch_size=512, shuffle=False, num_workers=16, persistent_workers=True, prefetch_factor=4)
-knn_val_dl   = DataLoader(knn_val_ds,   batch_size=512, shuffle=False, num_workers=16, persistent_workers=True, prefetch_factor=4)
+knn_train_dl = DataLoader(knn_train_ds, batch_size=512, shuffle=False, num_workers=12, persistent_workers=True, prefetch_factor=4)
+knn_val_dl   = DataLoader(knn_val_ds,   batch_size=512, shuffle=False, num_workers=12, persistent_workers=True, prefetch_factor=4)
 
 # -----
 # Model
 # -----
 
 print("\nBuilding model...")
-backbone = ConvNet2D(feat_dim=feat_dim)
+backbone = ConvNet2D(feat_dim=feat_dim, base_channels=64)
 projector = Projector(in_dim=feat_dim, hidden_dim=hidden_dim, out_dim=out_dim)
 
 student = DINOModel(backbone, projector, use_predictor=use_predictor).to(device)
@@ -238,10 +242,13 @@ for epoch in pbar:
         top1, top5 = knn_evaluate(student.backbone, knn_train_dl, knn_val_dl, knn_k, device)
         row["knn_top1"] = top1
         row["knn_top5"] = top5
+        lp_top1, lp_top5 = linear_probe_evaluate(student.backbone, knn_train_dl, knn_val_dl, device)
+        row["lp_top1"] = lp_top1
+        row["lp_top5"] = lp_top5
         msg = (
             f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f} "
             f"| grad {grad_norm:.3f} | center {center_norm:.3f} "
-            f"| kNN top1 {top1*100:.1f}% top5 {top5*100:.1f}% "
+            f"| kNN {top1*100:.1f}% | LP {lp_top1*100:.1f}% "
             f"| {epoch_secs:.1f}s/epoch | ETA {eta/60:.1f}min"
         )
     else:

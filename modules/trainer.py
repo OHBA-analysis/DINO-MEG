@@ -180,6 +180,70 @@ def knn_evaluate(backbone, train_loader, val_loader, k, device):
     return top1, top5
 
 
+def linear_probe_evaluate(backbone, train_loader, val_loader, device, probe_epochs=50, probe_lr=0.1):
+    """Linear probe evaluation on frozen backbone features.
+
+    Trains a linear classifier on extracted features and returns accuracy.
+    Returns (top1_acc, top5_acc) as floats in [0, 1].
+    """
+    import torch.nn as nn
+
+    was_training = backbone.training
+    backbone.eval()
+
+    # extract features
+    train_feats, train_labels = [], []
+    with torch.no_grad():
+        for images, labels in train_loader:
+            feats = backbone(images.to(device))
+            train_feats.append(feats.cpu())
+            train_labels.append(labels)
+    train_feats = torch.cat(train_feats, dim=0)
+    train_labels = torch.cat(train_labels, dim=0)
+
+    val_feats, val_labels = [], []
+    with torch.no_grad():
+        for images, labels in val_loader:
+            feats = backbone(images.to(device))
+            val_feats.append(feats.cpu())
+            val_labels.append(labels)
+    val_feats = torch.cat(val_feats, dim=0)
+    val_labels = torch.cat(val_labels, dim=0)
+
+    # train linear classifier
+    feat_dim = train_feats.shape[1]
+    n_classes = int(train_labels.max().item()) + 1
+    classifier = nn.Linear(feat_dim, n_classes)
+    opt = torch.optim.SGD(classifier.parameters(), lr=probe_lr, momentum=0.9)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=probe_epochs)
+    loss_fn = nn.CrossEntropyLoss()
+
+    dataset = torch.utils.data.TensorDataset(train_feats, train_labels)
+    loader = torch.utils.data.DataLoader(dataset, batch_size=512, shuffle=True)
+
+    classifier.train()
+    for _ in range(probe_epochs):
+        for feats_b, labels_b in loader:
+            logits = classifier(feats_b)
+            loss = loss_fn(logits, labels_b)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        scheduler.step()
+
+    # evaluate
+    classifier.eval()
+    with torch.no_grad():
+        logits = classifier(val_feats)
+        preds = logits.argmax(dim=1)
+        top1 = (preds == val_labels).float().mean().item()
+        top5_preds = logits.topk(min(5, n_classes), dim=1).indices
+        top5 = sum(val_labels[i] in top5_preds[i] for i in range(len(val_labels))) / len(val_labels)
+
+    backbone.train(was_training)
+    return top1, top5
+
+
 def train_one_epoch(
     student,
     teacher,

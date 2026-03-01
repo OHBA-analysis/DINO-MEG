@@ -27,21 +27,24 @@ class ConvNet(nn.Module):
 
 
 class ConvNet2D(nn.Module):
-    def __init__(self, feat_dim=256):
+    def __init__(self, feat_dim=256, base_channels=32):
         super().__init__()
+        c1 = base_channels
+        c2 = base_channels * 2
+        c3 = base_channels * 4
         self.net = nn.Sequential(
-            nn.Conv2d(1, 32, kernel_size=3, padding=1),
-            nn.BatchNorm2d(32),
+            nn.Conv2d(1, c1, kernel_size=3, padding=1),
+            nn.BatchNorm2d(c1),
             nn.ReLU(inplace=True),
-            nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(64),
+            nn.Conv2d(c1, c2, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(c2),
             nn.ReLU(inplace=True),
-            nn.Conv2d(64, 128, kernel_size=3, stride=2, padding=1),
-            nn.BatchNorm2d(128),
+            nn.Conv2d(c2, c3, kernel_size=3, stride=2, padding=1),
+            nn.BatchNorm2d(c3),
             nn.ReLU(inplace=True),
             nn.AdaptiveAvgPool2d(1),
             nn.Flatten(),
-            nn.Linear(128, feat_dim),
+            nn.Linear(c3, feat_dim),
         )
 
     def forward(self, x):

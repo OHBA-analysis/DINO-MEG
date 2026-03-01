@@ -40,7 +40,7 @@ print(f"Device: {device}")
 
 
 # ------------------------------------------------------------------ load model
-backbone = ConvNet2D(feat_dim=feat_dim).to(device)
+backbone = ConvNet2D(feat_dim=feat_dim, base_channels=64).to(device)
 backbone.load_state_dict(torch.load(CKPT, map_location=device, weights_only=True))
 backbone.eval()
 print("Backbone loaded.")
@@ -171,7 +171,7 @@ _global_crop = transforms.Compose([
     transforms.Normalize((0.1307,), (0.3081,)),
 ])
 _local_crop = transforms.Compose([
-    transforms.RandomResizedCrop(14, scale=(0.2, 0.4)),
+    transforms.RandomResizedCrop(20, scale=(0.4, 0.7)),
     transforms.RandomRotation(15),
     transforms.RandomAffine(degrees=0, shear=10, translate=(0.1, 0.1)),
     transforms.RandomApply([transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 1.0))], p=0.5),
@@ -181,7 +181,7 @@ _local_crop = transforms.Compose([
 
 raw_ds = datasets.MNIST(DATA_DIR, train=True, transform=transforms.ToTensor())
 n_show = 8
-view_labels = ["global 1 (28×28)", "global 2 (28×28)", "local 1 (14×14)", "local 2 (14×14)"]
+view_labels = ["global 1 (28×28)", "global 2 (28×28)", "local 1 (20×20)", "local 2 (20×20)"]
 
 fig, axes = plt.subplots(n_show, 5, figsize=(10, 2 * n_show))
 fig.suptitle("Augmented views per sample (columns: original | g1 | g2 | l1 | l2)",

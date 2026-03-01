@@ -20,6 +20,7 @@ from modules.trainer import (
     linear_warmup_cosine_decay,
     DINOLoss,
     knn_evaluate,
+    linear_probe_evaluate,
 )
 
 # ----------
@@ -46,8 +47,8 @@ use_predictor = False
 lr = 1e-3
 lr_start = 1e-6
 lr_final_scale = 0.001
-warmup_epochs = 5
-weight_decay = 0.01
+warmup_epochs = 10
+weight_decay = 0.04
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
 teacher_temp = 0.04
@@ -58,7 +59,7 @@ center_momentum = 0.9
 grad_clip_norm = 1.0
 knn_every = 5
 knn_k = 20
-save_every = 10
+save_every = 25
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -252,10 +253,13 @@ for epoch in range(epochs):
         top1, top5 = knn_evaluate(student.backbone, knn_train_dl, knn_eval_dl, knn_k, device)
         row["knn_top1"] = top1
         row["knn_top5"] = top5
+        lp_top1, lp_top5 = linear_probe_evaluate(student.backbone, knn_train_dl, knn_eval_dl, device)
+        row["lp_top1"] = lp_top1
+        row["lp_top5"] = lp_top5
         print(
             f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f} "
             f"| grad {grad_norm:.3f} | center {center_norm:.3f} "
-            f"| kNN top1 {top1*100:.1f}% top5 {top5*100:.1f}%"
+            f"| kNN {top1*100:.1f}% | LP {lp_top1*100:.1f}%"
         )
     else:
         print(
