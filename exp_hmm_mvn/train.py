@@ -11,21 +11,25 @@ import time
 import sys
 import numpy as np
 import torch
+from scipy.signal import butter, sosfiltfilt
+from tqdm import tqdm
 torch.multiprocessing.set_sharing_strategy("file_system")
 from torch.utils.data import DataLoader
 from copy import deepcopy
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.data import Transforms, MEGDataset, MEGLabeledDataset
-from modules.model import ConvNet, Projector, DINOModel
+from modules.data import Transforms, MEGDataset, MEGLabeledDataset, compute_amplitude_envelopes
+from modules.model import ConvNet, ConvNet2D, ViT1D, ViT2D, FilterbankNet, Projector, DINOModel
 from modules.trainer import (
     train_one_epoch,
     param_groups_lrd,
     linear_warmup_cosine_decay,
     DINOLoss,
+    MaskedPatchLoss,
     knn_evaluate,
     linear_probe_evaluate,
+    linear_probe_regression_evaluate,
 )
 
 # ----------
@@ -34,37 +38,81 @@ from modules.trainer import (
 
 DATA_DIR = os.path.join(os.path.dirname(__file__), "data")
 CKPT_DIR = os.path.join(os.path.dirname(__file__), "checkpoints")
-METRICS_FILE = os.path.join(os.path.dirname(__file__), "metrics.json")
+METRICS_FILE = os.path.join(os.path.dirname(__file__), "checkpoints", "metrics.json")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 n_channels = 52
 sampling_frequency = 250
-window_length = 3000
-stride = window_length // 2
-crop_lengths = [1000, 500]
+window_length = 500
+stride = 250
+crop_lengths = [375, 375]
+local_crop_length = 150
 n_local_crops = 2
 epochs = 100
-batch_size = 32
-feat_dim = 512
-hidden_dim = 1024
-out_dim = 8192
+batch_size = 64
+feat_dim = 256
+hidden_dim = 512
+out_dim = 2048
 use_predictor = False
-lr = 1e-3
+lr = 5e-4
 lr_start = 1e-6
 lr_final_scale = 0.001
-warmup_epochs = 10
-weight_decay = 0.04
+warmup_epochs = 3
+weight_decay = 0.05
 teacher_momentum = 0.996
 teacher_momentum_final = 1.0
 teacher_temp = 0.04
-teacher_temp_final = 0.07
-teacher_temp_warmup_epochs = 30
+teacher_temp_final = 0.04
+teacher_temp_warmup_epochs = 0
 student_temp = 0.1
 center_momentum = 0.9
 grad_clip_norm = 1.0
 knn_every = 5
-knn_k = 20
+knn_k = 10
 save_every = 25
+
+eval_window_length = 200
+eval_stride = 100
+
+# Input representation
+use_tf = False
+tf_freqs = [4, 6, 8, 10, 13, 17, 22, 28, 35, 43]  # 10 center frequencies
+
+# Backbone type
+backbone_type = "filterbank"  # "convnet", "vit", or "filterbank"
+vit_patch_size = 5               # 1D: temporal patch size
+vit_patch_size_2d = (5, 25)      # 2D: (freq, time) patch size
+vit_d_model = 192
+vit_n_heads = 4
+vit_n_layers = 4
+vit_dropout = 0.05
+
+# Filterbank backbone
+fb_n_filters = 8
+fb_filter_length = 65
+fb_hidden_dim = 128
+
+# Masked patch prediction (iBOT-style)
+use_masked_prediction = False
+mask_ratio = 0.3
+mask_loss_weight = 0.5
+
+# Temporal neighbor positive pairs
+use_temporal_neighbor = False
+
+# Bandpass filter (removes 1/f pink noise dominance)
+bandpass = (3, 45)  # Hz, or None to skip
+
+
+def bandpass_filter(X, fs, low, high):
+    """Bandpass filter and re-z-score. X: (C, T), returns (C, T) float32."""
+    sos = butter(4, [low / (fs / 2), high / (fs / 2)], btype="band", output="sos")
+    X_filt = sosfiltfilt(sos, X, axis=-1).astype(np.float32)
+    mean = X_filt.mean(axis=-1, keepdims=True)
+    std = X_filt.std(axis=-1, keepdims=True)
+    std[std == 0] = 1.0
+    return (X_filt - mean) / std
+
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -78,60 +126,94 @@ if device.type == "cuda":
 weak_transform = Transforms(
     sampling_frequency=sampling_frequency,
     add_noise_p=0.8,
-    noise_std=5e-4,
-    baseline_shift_p=0.2,
-    baseline_shift_std=5e-4,
-    scale_p=0.4,
-    scale_sigma=0.05,
-    amplitude_warp_p=0.2,
-    warp_max=0.05,
-    time_mask_p=0.3,
-    time_mask_ratio=0.03,
+    noise_std=0.10,
+    baseline_shift_p=0.3,
+    baseline_shift_std=0.03,
+    scale_p=0.5,
+    scale_sigma=0.10,
+    amplitude_warp_p=0.3,
+    warp_max=0.04,
+    time_mask_p=0.5,
+    time_mask_ratio=0.06,
     time_mask_n=1,
-    channel_mask_p=0.2,
-    channel_dropout_p=0.05,
-    notch_p=0.9,
-    notch_freqs=[50.0],
+    channel_mask_p=0.3,
+    channel_dropout_p=0.10,
+    notch_p=0.0,
+    notch_freqs=[],
     notch_bandwidth=1.0,
-    time_reverse_p=0.05,
+    freq_mask_p=0.0,
+    freq_mask_n=1,
+    freq_mask_max_width=1,
+    time_reverse_p=0.0,
 )
 strong_transform = Transforms(
     sampling_frequency=sampling_frequency,
     add_noise_p=0.95,
-    noise_std=3e-3,
+    noise_std=0.15,
     baseline_shift_p=0.4,
-    baseline_shift_std=1e-3,
+    baseline_shift_std=0.05,
     scale_p=0.6,
-    scale_sigma=0.12,
+    scale_sigma=0.15,
     amplitude_warp_p=0.6,
-    warp_max=0.15,
+    warp_max=0.05,
     time_mask_p=0.8,
     time_mask_ratio=0.08,
     time_mask_n=2,
     channel_mask_p=0.6,
-    channel_dropout_p=0.15,
-    notch_p=0.9,
-    notch_freqs=[50.0],
+    channel_dropout_p=0.2,
+    notch_p=0.0,
+    notch_freqs=[],
     notch_bandwidth=1.0,
-    time_reverse_p=0.1,
+    freq_mask_p=0.0,
+    freq_mask_n=1,
+    freq_mask_max_width=2,
+    time_reverse_p=0.0,
 )
 
 print("\nLoading data...")
-files = [os.path.join(DATA_DIR, "X_train.npy")]
-dataset = MEGDataset(
-    files,
-    window_length=window_length,
-    stride=stride,
-    crop_lengths=crop_lengths,
-    n_local_crops=n_local_crops,
-    weak_transform=weak_transform,
-    strong_transform=strong_transform,
-)
+if use_tf:
+    print(f"  Computing TF amplitude envelopes ({len(tf_freqs)} freqs)...")
+    X_train_raw = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+    if bandpass is not None:
+        print(f"  Bandpass filtering {bandpass[0]}-{bandpass[1]} Hz...")
+        X_train_raw = bandpass_filter(X_train_raw, sampling_frequency, *bandpass)
+    X_train_tf = compute_amplitude_envelopes(X_train_raw, sampling_frequency, tf_freqs,
+                                              log_transform=True, standardize=True)
+    del X_train_raw
+    dataset = MEGDataset(
+        arrays=[X_train_tf],
+        window_length=window_length,
+        stride=stride,
+        crop_lengths=crop_lengths,
+        n_local_crops=n_local_crops,
+        local_crop_length=local_crop_length,
+        weak_transform=weak_transform,
+        strong_transform=strong_transform,
+        temporal_neighbor=use_temporal_neighbor,
+    )
+    del X_train_tf
+else:
+    X_train_raw = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+    if bandpass is not None:
+        print(f"  Bandpass filtering {bandpass[0]}-{bandpass[1]} Hz...")
+        X_train_raw = bandpass_filter(X_train_raw, sampling_frequency, *bandpass)
+    dataset = MEGDataset(
+        arrays=[X_train_raw],
+        window_length=window_length,
+        stride=stride,
+        crop_lengths=crop_lengths,
+        n_local_crops=n_local_crops,
+        local_crop_length=local_crop_length,
+        weak_transform=weak_transform,
+        strong_transform=strong_transform,
+        temporal_neighbor=use_temporal_neighbor,
+    )
+    del X_train_raw
 dl = DataLoader(
     dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=4,
+    num_workers=8,
     pin_memory=True,
     collate_fn=lambda b: b,
 )
@@ -145,17 +227,64 @@ Y_eval = np.load(os.path.join(DATA_DIR, "Y_eval.npy"))
 X_train_arr = np.load(os.path.join(DATA_DIR, "X_train.npy"))
 Y_train_arr = np.load(os.path.join(DATA_DIR, "Y_train.npy"))
 
-knn_train_ds = MEGLabeledDataset(X_train_arr, Y_train_arr, window_length, stride)
-knn_eval_ds = MEGLabeledDataset(X_eval, Y_eval, window_length, stride)
-knn_train_dl = DataLoader(knn_train_ds, batch_size=128, shuffle=False, num_workers=4)
-knn_eval_dl = DataLoader(knn_eval_ds, batch_size=128, shuffle=False, num_workers=4)
+if bandpass is not None:
+    print(f"  Bandpass filtering eval/train k-NN data {bandpass[0]}-{bandpass[1]} Hz...")
+    X_eval = bandpass_filter(X_eval, sampling_frequency, *bandpass)
+    X_train_arr = bandpass_filter(X_train_arr, sampling_frequency, *bandpass)
+
+if use_tf:
+    print(f"  Computing TF for eval/train k-NN data...")
+    X_eval_knn = compute_amplitude_envelopes(X_eval, sampling_frequency, tf_freqs,
+                                              log_transform=True, standardize=True)
+    X_train_knn = compute_amplitude_envelopes(X_train_arr, sampling_frequency, tf_freqs,
+                                               log_transform=True, standardize=True)
+else:
+    X_eval_knn = X_eval
+    X_train_knn = X_train_arr
+
+knn_train_ds = MEGLabeledDataset(X_train_knn, Y_train_arr, eval_window_length, eval_stride)
+knn_eval_ds = MEGLabeledDataset(X_eval_knn, Y_eval, eval_window_length, eval_stride)
+knn_train_dl = DataLoader(knn_train_ds, batch_size=128, shuffle=False, num_workers=8)
+knn_eval_dl = DataLoader(knn_eval_ds, batch_size=128, shuffle=False, num_workers=8)
 
 # -------------------------
 # Student and teacher model
 # -------------------------
 
 print("\nBuilding model...")
-backbone = ConvNet(in_channels=n_channels, feat_dim=feat_dim)
+if use_tf:
+    # TF mode: input is (B, C, F, T) — use 2D backbones
+    if backbone_type == "convnet":
+        backbone = ConvNet2D(in_channels=n_channels, feat_dim=feat_dim)
+    elif backbone_type == "vit":
+        backbone = ViT2D(
+            in_channels=n_channels, feat_dim=feat_dim,
+            patch_size=vit_patch_size_2d, d_model=vit_d_model,
+            n_heads=vit_n_heads, n_layers=vit_n_layers, dropout=vit_dropout,
+        )
+    elif backbone_type == "filterbank":
+        raise ValueError("FilterbankNet is a 1D backbone — set use_tf=False")
+    else:
+        raise ValueError(f"Unknown backbone_type: {backbone_type}")
+else:
+    # Raw mode: input is (B, C, T) — use 1D backbones
+    if backbone_type == "convnet":
+        backbone = ConvNet(in_channels=n_channels, feat_dim=feat_dim, kernel_sizes=[25, 9, 5])
+    elif backbone_type == "vit":
+        backbone = ViT1D(
+            in_channels=n_channels, feat_dim=feat_dim,
+            patch_size=vit_patch_size, d_model=vit_d_model,
+            n_heads=vit_n_heads, n_layers=vit_n_layers, dropout=vit_dropout,
+            use_mask_token=use_masked_prediction,
+        )
+    elif backbone_type == "filterbank":
+        backbone = FilterbankNet(
+            in_channels=n_channels, feat_dim=feat_dim,
+            n_filters=fb_n_filters, filter_length=fb_filter_length,
+            hidden_dim=fb_hidden_dim,
+        )
+    else:
+        raise ValueError(f"Unknown backbone_type: {backbone_type}")
 projector = Projector(in_dim=feat_dim, hidden_dim=hidden_dim, out_dim=out_dim)
 
 student = DINOModel(backbone, projector, use_predictor=use_predictor).to(device)
@@ -171,6 +300,16 @@ print(f"  Parameters: {n_params:,}")
 # -----------------------
 
 param_groups = param_groups_lrd(student, weight_decay=weight_decay)
+
+# Masked patch prediction loss
+if use_masked_prediction and backbone_type == "vit":
+    mask_loss_obj = MaskedPatchLoss(vit_d_model).to(device)
+    mask_param_groups = param_groups_lrd(mask_loss_obj, weight_decay=weight_decay)
+    param_groups.extend(mask_param_groups)
+    print(f"  MaskedPatchLoss params: {sum(p.numel() for p in mask_loss_obj.parameters()):,}")
+else:
+    mask_loss_obj = None
+
 opt = torch.optim.AdamW(param_groups, lr=lr, betas=(0.9, 0.999))
 
 n_iter_per_epoch = len(dl)
@@ -230,7 +369,8 @@ print(f"  Checkpoints: {CKPT_DIR}")
 print(f"  Metrics:     {METRICS_FILE}\n")
 train_start = time.time()
 
-for epoch in range(epochs):
+pbar = tqdm(range(epochs), desc="Training", unit="ep")
+for epoch in pbar:
     step, epoch_loss, grad_norm, center_norm = train_one_epoch(
         student,
         teacher,
@@ -245,6 +385,9 @@ for epoch in range(epochs):
         step,
         grad_clip_norm,
         teacher_temp_schedule=teacher_temp_schedule,
+        mask_loss_obj=mask_loss_obj,
+        mask_ratio=mask_ratio if use_masked_prediction else 0.0,
+        mask_loss_weight=mask_loss_weight if use_masked_prediction else 0.0,
     )
 
     row = {
@@ -261,13 +404,19 @@ for epoch in range(epochs):
         lp_top1, lp_top5 = linear_probe_evaluate(student.backbone, knn_train_dl, knn_eval_dl, device)
         row["lp_top1"] = lp_top1
         row["lp_top5"] = lp_top5
-        print(
+        lp_r2, lp_r2_per_state = linear_probe_regression_evaluate(
+            student.backbone, knn_train_dl, knn_eval_dl,
+            knn_train_ds, knn_eval_ds, n_classes=5, device=device,
+        )
+        row["lp_r2"] = lp_r2
+        row["lp_r2_per_state"] = lp_r2_per_state
+        tqdm.write(
             f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f} "
             f"| grad {grad_norm:.3f} | center {center_norm:.3f} "
-            f"| kNN {top1*100:.1f}% | LP {lp_top1*100:.1f}%"
+            f"| kNN {top1*100:.1f}% | LP {lp_top1*100:.1f}% | R² {lp_r2:.3f}"
         )
     else:
-        print(
+        tqdm.write(
             f"Epoch {epoch+1:3d} | loss {epoch_loss:.4f} "
             f"| grad {grad_norm:.3f} | center {center_norm:.3f}"
         )
@@ -288,7 +437,7 @@ for epoch in range(epochs):
         }
         ckpt_path = os.path.join(CKPT_DIR, f"checkpoint_epoch{epoch+1:04d}.pt")
         torch.save(ckpt, ckpt_path)
-        print(f"  Checkpoint saved: {ckpt_path}")
+        tqdm.write(f"  Checkpoint saved: {ckpt_path}")
 
 total_mins = (time.time() - train_start) / 60
 print(f"\nTraining complete in {total_mins:.1f} min")

@@ -18,6 +18,5 @@ dependencies:
   - scikit-learn
   - pip:
       - mne
-      - timm
       - nibabel
       - nilearn

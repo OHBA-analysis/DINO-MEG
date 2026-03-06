@@ -1,7 +1,9 @@
 """Trainer."""
 
 import math
+import numpy as np
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 
 
@@ -60,6 +62,41 @@ class DINOLoss:
                 self.registered_center * self.center_momentum
                 + batch_center * (1.0 - self.center_momentum)
             )
+
+
+class MaskedPatchLoss(nn.Module):
+    """Predict teacher patch tokens at masked positions (iBOT-style).
+
+    A lightweight prediction head maps student patch representations to
+    teacher space.  Loss is smooth-L1 on L2-normalised vectors at masked
+    positions only.
+    """
+
+    def __init__(self, d_model):
+        super().__init__()
+        self.pred_head = nn.Sequential(
+            nn.Linear(d_model, d_model),
+            nn.GELU(),
+            nn.LayerNorm(d_model),
+            nn.Linear(d_model, d_model),
+        )
+
+    def forward(self, student_patches, teacher_patches, mask):
+        """Compute prediction loss at masked positions.
+
+        Parameters
+        ----------
+        student_patches : (B, N, D)
+        teacher_patches : (B, N, D)
+        mask : (B, N) bool — True at masked positions
+        """
+        if not mask.any():
+            return torch.tensor(0.0, device=student_patches.device)
+        s = self.pred_head(student_patches[mask])  # (n_masked, D)
+        t = teacher_patches[mask].detach()  # (n_masked, D)
+        s = F.normalize(s, dim=-1)
+        t = F.normalize(t, dim=-1)
+        return F.smooth_l1_loss(s, t)
 
 
 def linear_warmup_cosine_decay(
@@ -244,6 +281,80 @@ def linear_probe_evaluate(backbone, train_loader, val_loader, device, probe_epoc
     return top1, top5
 
 
+def linear_probe_regression_evaluate(backbone, train_loader, eval_loader,
+                                      train_dataset, eval_dataset,
+                                      n_classes, device,
+                                      probe_epochs=50, probe_lr=0.01):
+    """Linear probe regression: predict fractional state occupancy.
+
+    Instead of majority-vote classification, predicts the proportion of each
+    state within each window (e.g., [0.0, 0.6, 0.4, 0.0, 0.0]).
+
+    Returns (mean_r2, per_state_r2_list).
+    """
+    was_training = backbone.training
+    backbone.eval()
+
+    # Extract features
+    def extract_feats(loader):
+        feats = []
+        with torch.no_grad():
+            for images, _ in loader:
+                feats.append(backbone(images.to(device)).cpu())
+        return torch.cat(feats)
+
+    train_feats = extract_feats(train_loader)
+    eval_feats = extract_feats(eval_loader)
+
+    # Compute fractional occupancies from dataset label arrays
+    def compute_occupancies(dataset):
+        occs = []
+        for start in dataset.windows:
+            labels = dataset.labels[start:start + dataset.window_length]
+            occ = np.bincount(labels, minlength=n_classes).astype(np.float32)
+            occ /= dataset.window_length
+            occs.append(occ)
+        return torch.from_numpy(np.array(occs))
+
+    train_occs = compute_occupancies(train_dataset)
+    eval_occs = compute_occupancies(eval_dataset)
+
+    # Train linear regression
+    feat_dim = train_feats.shape[1]
+    regressor = nn.Linear(feat_dim, n_classes)
+    opt = torch.optim.Adam(regressor.parameters(), lr=probe_lr)
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=probe_epochs)
+    loss_fn = nn.MSELoss()
+
+    ds = torch.utils.data.TensorDataset(train_feats, train_occs)
+    loader = torch.utils.data.DataLoader(ds, batch_size=512, shuffle=True)
+
+    regressor.train()
+    for _ in range(probe_epochs):
+        for feats_b, occs_b in loader:
+            pred = regressor(feats_b)
+            loss = loss_fn(pred, occs_b)
+            opt.zero_grad()
+            loss.backward()
+            opt.step()
+        scheduler.step()
+
+    # Evaluate: R² per state
+    regressor.eval()
+    with torch.no_grad():
+        pred = regressor(eval_feats).numpy()
+    true = eval_occs.numpy()
+
+    r2_per_state = []
+    for c in range(n_classes):
+        ss_res = ((true[:, c] - pred[:, c]) ** 2).sum()
+        ss_tot = ((true[:, c] - true[:, c].mean()) ** 2).sum()
+        r2_per_state.append(float(1.0 - ss_res / (ss_tot + 1e-8)))
+
+    backbone.train(was_training)
+    return float(np.mean(r2_per_state)), r2_per_state
+
+
 def train_one_epoch(
     student,
     teacher,
@@ -258,15 +369,25 @@ def train_one_epoch(
     step,
     grad_clip_norm,
     teacher_temp_schedule=None,
+    mask_loss_obj=None,
+    mask_ratio=0.0,
+    mask_loss_weight=0.0,
 ):
     """
     Runs one epoch of training and returns updated step, epoch_loss, mean_grad_norm,
     and center_norm. Encapsulates forward, loss, diagnostics, backward, EMA update.
+
+    When mask_loss_obj is provided, adds iBOT-style masked patch prediction:
+    student sees masked patches, predicts teacher's unmasked patch representations.
     """
     student.train()
+    if mask_loss_obj is not None:
+        mask_loss_obj.train()
     running_loss = 0.0
     running_grad_norm = 0.0
     n_iter = len(dl)
+    use_masking = mask_loss_obj is not None and mask_ratio > 0
+
     for it, batch in enumerate(dl):
         # update lr for optimizer param groups (before step)
         for pg in opt.param_groups:
@@ -277,39 +398,99 @@ def train_one_epoch(
 
         # forward student with AMP — batch views with the same spatial size
         student_outputs = [None] * len(view_tensors)
+        student_patch_tokens = [None] * len(view_tensors) if use_masking else None
+        view_masks = [None] * len(view_tensors) if use_masking else None
+
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
             groups = {}
             for i, vt in enumerate(view_tensors):
                 groups.setdefault(vt.shape[2:], []).append(i)
             for indices in groups.values():
                 cat = torch.cat([view_tensors[i] for i in indices], dim=0)
-                out = student(cat)
-                for i, chunk in zip(indices, out.chunk(len(indices))):
-                    student_outputs[i] = chunk
+                if use_masking:
+                    ps = getattr(student.backbone, 'patch_size', None)
+                    if ps is not None:
+                        T_len = cat.shape[-1]
+                        remainder = T_len % ps
+                        n_patches = (T_len + (ps - remainder if remainder else 0)) // ps
+                        m = torch.rand(cat.shape[0], n_patches, device=device) < mask_ratio
+                        out, pt = student(cat, mask=m, return_patch_tokens=True)
+                        B = view_tensors[indices[0]].shape[0]
+                        for j, idx in enumerate(indices):
+                            student_outputs[idx] = out[j * B:(j + 1) * B]
+                            student_patch_tokens[idx] = pt[j * B:(j + 1) * B]
+                            view_masks[idx] = m[j * B:(j + 1) * B]
+                    else:
+                        out = student(cat)
+                        for i, chunk in zip(indices, out.chunk(len(indices))):
+                            student_outputs[i] = chunk
+                else:
+                    out = student(cat)
+                    for i, chunk in zip(indices, out.chunk(len(indices))):
+                        student_outputs[i] = chunk
 
-        # forward teacher (only global views) — batch same-size globals
-        teacher_outputs = [None] * len(global_teacher_view_idxs)
-        with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
-                groups = {}
-                for j, gi in enumerate(global_teacher_view_idxs):
-                    groups.setdefault(view_tensors[gi].shape[2:], []).append(j)
-                for indices in groups.values():
-                    cat = torch.cat([view_tensors[global_teacher_view_idxs[j]] for j in indices], dim=0)
-                    out = teacher(cat)
-                    for j, chunk in zip(indices, out.chunk(len(indices))):
-                        teacher_outputs[j] = chunk
+        # forward teacher
+        if use_masking:
+            # Teacher processes ALL views (unmasked) for patch token targets
+            teacher_all_outputs = [None] * len(view_tensors)
+            teacher_patch_tokens = [None] * len(view_tensors)
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                    groups = {}
+                    for i, vt in enumerate(view_tensors):
+                        groups.setdefault(vt.shape[2:], []).append(i)
+                    for indices in groups.values():
+                        cat = torch.cat([view_tensors[i] for i in indices], dim=0)
+                        out, pt = teacher(cat, return_patch_tokens=True)
+                        B = view_tensors[indices[0]].shape[0]
+                        for j, idx in enumerate(indices):
+                            teacher_all_outputs[idx] = out[j * B:(j + 1) * B]
+                            teacher_patch_tokens[idx] = pt[j * B:(j + 1) * B]
+            teacher_outputs = [teacher_all_outputs[gi] for gi in global_teacher_view_idxs]
+        else:
+            teacher_patch_tokens = None
+            teacher_outputs = [None] * len(global_teacher_view_idxs)
+            with torch.no_grad():
+                with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+                    groups = {}
+                    for j, gi in enumerate(global_teacher_view_idxs):
+                        groups.setdefault(view_tensors[gi].shape[2:], []).append(j)
+                    for indices in groups.values():
+                        cat = torch.cat([view_tensors[global_teacher_view_idxs[j]] for j in indices], dim=0)
+                        out = teacher(cat)
+                        for j, chunk in zip(indices, out.chunk(len(indices))):
+                            teacher_outputs[j] = chunk
 
-        # compute loss
+        # compute DINO loss
         t_temp = teacher_temp_schedule[step] if teacher_temp_schedule is not None else None
         loss = loss_obj.loss(student_outputs, teacher_outputs, global_teacher_view_idxs, teacher_temp=t_temp)
+
+        # compute masked patch prediction loss
+        if use_masking and student_patch_tokens is not None and teacher_patch_tokens is not None:
+            mask_loss = 0.0
+            n_mask_terms = 0
+            for i in range(len(view_tensors)):
+                if (student_patch_tokens[i] is not None
+                        and teacher_patch_tokens[i] is not None
+                        and view_masks[i] is not None):
+                    ml = mask_loss_obj(student_patch_tokens[i],
+                                       teacher_patch_tokens[i],
+                                       view_masks[i])
+                    mask_loss = mask_loss + ml
+                    n_mask_terms += 1
+            if n_mask_terms > 0:
+                mask_loss = mask_loss / n_mask_terms
+                loss = loss + mask_loss_weight * mask_loss
 
         # backward with scaler
         opt.zero_grad()
         scaler.scale(loss).backward()
         if grad_clip_norm > 0:
             scaler.unscale_(opt)
-            grad_norm = torch.nn.utils.clip_grad_norm_(student.parameters(), grad_clip_norm).item()
+            params_to_clip = list(student.parameters())
+            if mask_loss_obj is not None:
+                params_to_clip.extend(mask_loss_obj.parameters())
+            grad_norm = torch.nn.utils.clip_grad_norm_(params_to_clip, grad_clip_norm).item()
         else:
             grad_norm = 0.0
         scaler.step(opt)

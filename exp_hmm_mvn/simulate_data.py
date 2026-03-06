@@ -1,7 +1,7 @@
 """Simulate switching oscillatory burst data for DINO validation.
 
 Signal model:
-    x(t) = sum_k  alpha_k(t) * A_k * s_k(t) * OSC_AMPLITUDE  +  pink(t)  +  white(t)
+    x(t) = sum_k  alpha_k(t) * A_k * s_k(t) * amp_k  +  pink(t)  +  white(t)
 
 States: theta (4-8 Hz), alpha (7.5-12.5 Hz), beta (15-25 Hz),
         low-gamma (28-42 Hz), background (no oscillation).
@@ -24,26 +24,27 @@ os.makedirs(DATA_DIR, exist_ok=True)
 N_CHANNELS = 52
 FS = 250  # Hz
 N_STATES = 5
-STAY_PROB = 0.992
-OSC_AMPLITUDE = 1.5  # oscillation RMS relative to pink noise RMS
+STAY_PROB = 0.96  # mean burst duration = 1/(1-p) = 25 samples = 100 ms
 PINK_EXPONENT = 1.0
 WHITE_NOISE_STD = 0.05  # small sensor noise
 BUTTER_ORDER = 4
 
-# State definitions: (name, center_freq, bandwidth) — None means background
+# State definitions: (name, center_freq, bandwidth, amplitude)
+# Amplitude = oscillation RMS relative to pink noise RMS
+# Mimics real MEG: alpha strongest, gamma weakest
 STATES = [
-    ("theta", 6, 2),       # 4–8 Hz
-    ("alpha", 10, 2.5),    # 7.5–12.5 Hz
-    ("beta", 20, 5),       # 15–25 Hz
-    ("low_gamma", 35, 7),  # 28–42 Hz
-    ("background", None, None),
+    ("theta", 6, 2, 1.5),       # 4–8 Hz, moderate
+    ("alpha", 10, 2.5, 2.0),    # 7.5–12.5 Hz, strongest
+    ("beta", 20, 5, 1.0),       # 15–25 Hz, weaker
+    ("low_gamma", 35, 7, 0.7),  # 28–42 Hz, weakest
+    ("background", None, None, 0.0),
 ]
 
 # Data sizes
-TRAIN_MINUTES = 20
-EVAL_MINUTES = 5
-N_TRAIN = FS * 60 * TRAIN_MINUTES  # 300 000
-N_EVAL = FS * 60 * EVAL_MINUTES    # 75 000
+TRAIN_MINUTES = 120
+EVAL_MINUTES = 10
+N_TRAIN = FS * 60 * TRAIN_MINUTES  # 1 800 000
+N_EVAL = FS * 60 * EVAL_MINUTES    # 150 000
 
 
 def simulate_markov_chain(n_samples, n_states, stay_prob, rng):
@@ -163,7 +164,7 @@ def generate_spatial_patterns(n_channels, n_states, rng):
     assert n_channels == 52, "Spatial patterns assume 52 Glasser parcels"
     patterns = np.zeros((n_states, n_channels), dtype=np.float64)
 
-    for k, (name, center, bw) in enumerate(STATES):
+    for k, (name, center, bw, amp) in enumerate(STATES):
         if center is None:
             # Background state: no spatial pattern needed (no oscillation)
             continue
@@ -197,15 +198,36 @@ def simulate_data(n_samples, seed):
     # 3. Spatial patterns for each state
     patterns = generate_spatial_patterns(N_CHANNELS, N_STATES, rng)
 
-    # 4. Generate oscillatory sources (full length, gated by state activation)
+    # 4. Generate oscillatory sources with random phase per burst
+    #    Each burst samples from a random offset in a long source, giving
+    #    independent initial phase per activation (more realistic than gating
+    #    a single continuous oscillation).
     signal = np.zeros((N_CHANNELS, n_samples), dtype=np.float64)
-    for k, (name, center, bw) in enumerate(STATES):
+    for k, (name, center, bw, amp) in enumerate(STATES):
         if center is None:
             continue  # background state — no oscillation
-        source = generate_oscillatory_source(n_samples, center, bw, rng)
-        activation = (states == k).astype(np.float64)  # binary gate
-        gated = source * activation  # preserves phase continuity
-        signal += OSC_AMPLITUDE * np.outer(patterns[k], gated)
+
+        source = generate_oscillatory_source(n_samples + 1000, center, bw, rng)
+        source_len = len(source)
+
+        # Find burst boundaries (contiguous runs of state k)
+        activation = (states == k)
+        diffs = np.diff(activation.astype(np.int8))
+        starts = np.where(diffs == 1)[0] + 1
+        ends = np.where(diffs == -1)[0] + 1
+        if activation[0]:
+            starts = np.concatenate([[0], starts])
+        if activation[-1]:
+            ends = np.concatenate([ends, [n_samples]])
+
+        # Each burst samples from a random position → independent phase
+        gated = np.zeros(n_samples, dtype=np.float64)
+        for s, e in zip(starts, ends):
+            burst_len = e - s
+            offset = rng.integers(0, source_len - burst_len + 1)
+            gated[s:e] = source[offset:offset + burst_len]
+
+        signal += amp * np.outer(patterns[k], gated)
 
     # 5. Compose: pink noise + oscillatory signal + white sensor noise
     white = WHITE_NOISE_STD * rng.standard_normal((N_CHANNELS, n_samples))
@@ -227,7 +249,7 @@ def print_state_statistics(states, label):
     print(f"  {'State':<15} {'Count':>8} {'Proportion':>10} {'Mean dur (ms)':>14} {'Median dur (ms)':>16}")
     print("  " + "-" * 65)
 
-    for k, (name, _, _) in enumerate(STATES):
+    for k, (name, _, _, _) in enumerate(STATES):
         mask = states == k
         count = mask.sum()
         prop = count / n
@@ -270,11 +292,11 @@ if __name__ == "__main__":
         "fs": FS,
         "n_states": N_STATES,
         "stay_prob": STAY_PROB,
-        "osc_amplitude": OSC_AMPLITUDE,
+        "state_amplitudes": {name: amp for name, _, _, amp in STATES},
         "pink_exponent": PINK_EXPONENT,
         "white_noise_std": WHITE_NOISE_STD,
         "butter_order": BUTTER_ORDER,
-        "states": [(name, center, bw) for name, center, bw in STATES],
+        "states": [(name, center, bw, amp) for name, center, bw, amp in STATES],
         "n_train": N_TRAIN,
         "n_eval": N_EVAL,
     }

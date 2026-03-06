@@ -35,10 +35,15 @@ exp_mnist/        # Sanity-check experiment on MNIST (2D conv)
   checkpoints/
   figures/
 
-exp_hmm_mvn/      # Validation experiment on HMM-MVN simulated MEG (1D conv, 52ch)
-  simulate_data.py
+exp_hmm_mvn/      # Validation experiment on oscillatory burst simulated MEG (1D conv, 52ch)
+  simulate_data.py  # Markov-switched theta/alpha/beta/gamma bursts + pink noise, Glasser52 spatial patterns
   train.py
+  diagnose.py     # Post-hoc: training curves, confusion matrix, per-state accuracy, t-SNE
+  analyse.py      # Deep analysis: GradCAM, channel attribution vs ground truth, PCA, NN retrieval, feature–frequency correlation, inter-state similarity
+  view_data.py    # Raw signal visualisation: timeseries, PSD, spectrogram, state durations, power maps
   data/           # X_train.npy, Y_train.npy, X_eval.npy, Y_eval.npy
+  checkpoints/
+  figures/
 
 envs/
   torch.yml       # Conda environment spec
@@ -74,4 +79,4 @@ New experiments follow the `exp_<name>/` pattern with their own `train.py`, `dat
 - Hyperparameters defined as module-level constants at the top of each `train.py`
 - Use `torch.multiprocessing.set_sharing_strategy("file_system")` at the top of train scripts (needed on this cluster)
 - Checkpoints saved as `checkpoint_epoch{epoch:04d}.pt` with full training state
-- Metrics logged to `metrics.json` as a list of dicts (one per epoch)
+- Metrics logged to `checkpoints/metrics.json` as a list of dicts (one per epoch)

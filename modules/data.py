@@ -6,6 +6,60 @@ import torch
 from torch.utils.data import Dataset
 
 
+def compute_amplitude_envelopes(X, fs, freqs, n_jobs=4,
+                                log_transform=False, standardize=False):
+    """Morlet wavelet amplitude envelopes.
+
+    Parameters
+    ----------
+    X : ndarray, shape (C, T)
+        Multichannel time-series.
+    fs : int
+        Sampling frequency in Hz.
+    freqs : array-like of float
+        Center frequencies for Morlet wavelets.
+    n_jobs : int
+        Number of parallel jobs for MNE.
+    log_transform : bool
+        If True, apply log(amplitude + 1e-6) to compress dynamic range.
+    standardize : bool
+        If True, z-score each (channel, freq) pair over time.
+
+    Returns
+    -------
+    envelopes : ndarray, shape (C, n_freqs, T), float32
+    """
+    from mne.time_frequency import tfr_array_morlet
+
+    freqs = np.asarray(freqs, dtype=float)
+    n_cycles = np.full_like(freqs, 3.0)
+
+    # tfr_array_morlet expects (n_epochs, n_channels, n_times)
+    power = tfr_array_morlet(
+        X[np.newaxis],
+        sfreq=fs,
+        freqs=freqs,
+        n_cycles=n_cycles,
+        output="power",
+        use_fft=True,
+        zero_mean=True,
+        n_jobs=n_jobs,
+    )  # (1, C, n_freqs, T)
+
+    amplitude = np.sqrt(power[0])  # (C, n_freqs, T)
+
+    if log_transform:
+        amplitude = np.log(amplitude + 1e-6)
+
+    if standardize:
+        mean = amplitude.mean(axis=-1, keepdims=True)  # (C, n_freqs, 1)
+        std = amplitude.std(axis=-1, keepdims=True)
+        std[std == 0] = 1.0
+        amplitude = (amplitude - mean) / std
+
+    return amplitude.astype(np.float32)
+
+
 def _rand_choice(p):
     return random.random() < p
 
@@ -20,6 +74,9 @@ def _fft_notch(x, fs, freq, bandwidth=1.0):
 
 
 def _time_warp(arr, max_warp=0.12):
+    """Time warp via interpolation. Only supports 2D (C, T) arrays."""
+    if arr.ndim != 2:
+        return arr
     C, T = arr.shape
     scale = 1.0 + np.random.uniform(-max_warp, max_warp)
     old_t = np.arange(T)
@@ -34,27 +91,32 @@ def _time_warp(arr, max_warp=0.12):
 
 
 def _time_mask(arr, mask_ratio=0.05, n_masks=1):
-    C, T = arr.shape
+    """Mask random time segments. Works with (..., T) arrays."""
+    T = arr.shape[-1]
     out = arr.copy()
     L = int(T * mask_ratio)
     for _ in range(n_masks):
         if L <= 0:
             break
         start = random.randint(0, max(0, T - L))
-        out[:, start : start + L] = 0.0
+        out[..., start : start + L] = 0.0
     return out
 
 
 def _channel_mask(arr, mask_p=0.15):
-    C, T = arr.shape
+    """Mask random channels (first axis). Works with (C, ...) arrays."""
+    C = arr.shape[0]
     mask = (np.random.rand(C) >= mask_p).astype(arr.dtype)
-    return arr * mask[:, None]
+    shape = (C,) + (1,) * (arr.ndim - 1)
+    return arr * mask.reshape(shape)
 
 
 def _amplitude_scaling(arr, sigma=0.1):
-    C, T = arr.shape
+    """Scale channels randomly. Works with (C, ...) arrays."""
+    C = arr.shape[0]
     scales = np.random.normal(1.0, sigma, size=(C,))
-    return arr * scales[:, None]
+    shape = (C,) + (1,) * (arr.ndim - 1)
+    return arr * scales.reshape(shape)
 
 
 def _add_gaussian_noise(arr, std):
@@ -64,20 +126,36 @@ def _add_gaussian_noise(arr, std):
     return arr + noise
 
 
+def _freq_mask(arr, n_masks=1, max_width=2):
+    """Mask random frequency bands. Only for 3D (C, F, T) arrays."""
+    if arr.ndim != 3:
+        return arr
+    out = arr.copy()
+    n_freqs = arr.shape[1]
+    for _ in range(n_masks):
+        width = random.randint(1, max_width)
+        start = random.randint(0, max(0, n_freqs - width))
+        out[:, start:start + width, :] = 0.0
+    return out
+
+
 def _baseline_shift(arr, shift_std=1e-3):
-    C, T = arr.shape
+    """Shift channels by random constant. Works with (C, ...) arrays."""
+    C = arr.shape[0]
     shifts = np.random.normal(0.0, shift_std, size=(C,))
-    return arr + shifts[:, None]
+    shape = (C,) + (1,) * (arr.ndim - 1)
+    return arr + shifts.reshape(shape)
 
 
 def _random_crop(arr, crop_length):
-    C, T = arr.shape
+    """Random crop along last axis. Works with (..., T) arrays."""
+    T = arr.shape[-1]
     if T <= crop_length:
-        pad = crop_length - T
-        out = np.pad(arr, ((0, 0), (0, pad)), mode="constant")
-        return out.astype(arr.dtype)
+        pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, crop_length - T)]
+        out = np.pad(arr, pad_width, mode="constant")
+        return out[..., :crop_length].astype(arr.dtype)
     start = random.randint(0, T - crop_length)
-    return arr[:, start : start + crop_length].astype(arr.dtype)
+    return arr[..., start : start + crop_length].astype(arr.dtype)
 
 
 class Transforms:
@@ -100,7 +178,11 @@ class Transforms:
         notch_p=0.9,
         notch_freqs=None,
         notch_bandwidth=1.0,
+        freq_mask_p=0.0,
+        freq_mask_n=1,
+        freq_mask_max_width=2,
         time_reverse_p=0.05,
+        sign_flip_p=0.0,
         random_crop_len=None,
     ):
         self.sampling_frequency = sampling_frequency
@@ -120,7 +202,11 @@ class Transforms:
         self.notch_p = notch_p
         self.notch_freqs = notch_freqs or []
         self.notch_bandwidth = notch_bandwidth
+        self.freq_mask_p = freq_mask_p
+        self.freq_mask_n = freq_mask_n
+        self.freq_mask_max_width = freq_mask_max_width
         self.time_reverse_p = time_reverse_p
+        self.sign_flip_p = sign_flip_p
         self.random_crop_len = random_crop_len
 
     def __call__(self, arr):
@@ -141,8 +227,12 @@ class Transforms:
             )
         if _rand_choice(self.channel_mask_p):
             out = _channel_mask(out, mask_p=self.channel_dropout_p)
+        if _rand_choice(self.freq_mask_p):
+            out = _freq_mask(out, n_masks=self.freq_mask_n,
+                             max_width=self.freq_mask_max_width)
         if (
-            self.sampling_frequency is not None
+            out.ndim == 2
+            and self.sampling_frequency is not None
             and self.notch_freqs
             and _rand_choice(self.notch_p)
         ):
@@ -155,7 +245,9 @@ class Transforms:
                         bandwidth=self.notch_bandwidth,
                     )
         if _rand_choice(self.time_reverse_p):
-            out = np.flip(out, axis=1).copy()
+            out = np.flip(out, axis=-1).copy()
+        if _rand_choice(self.sign_flip_p):
+            out = -out
         return out.astype(arr.dtype)
 
 
@@ -164,7 +256,7 @@ class MEGLabeledDataset(Dataset):
 
     Parameters
     ----------
-    data : ndarray, shape (C, T)
+    data : ndarray, shape (..., T) — e.g. (C, T) or (C, F, T)
     labels : ndarray, shape (T,)
     window_length : int
     stride : int
@@ -175,7 +267,7 @@ class MEGLabeledDataset(Dataset):
         self.window_length = int(window_length)
         self.stride = int(stride)
 
-        C, T = data.shape
+        T = data.shape[-1]
         self.windows = []
         if T < self.window_length:
             self.windows.append(0)
@@ -188,7 +280,7 @@ class MEGLabeledDataset(Dataset):
 
     def __getitem__(self, idx):
         start = self.windows[idx]
-        window = self.data[:, start:start + self.window_length].astype(np.float32)
+        window = self.data[..., start:start + self.window_length].astype(np.float32)
         window_labels = self.labels[start:start + self.window_length]
         majority_label = int(np.bincount(window_labels).argmax())
         return torch.from_numpy(window), majority_label
@@ -199,12 +291,12 @@ class MEGDataset(Dataset):
 
     Each __getitem__ returns:
         [view0, view1, ..., viewN]
-    where each view is a (C, L) tensor.
+    where each view is a (..., L) tensor — (C, L) for raw or (C, F, L) for TF.
 
     Parameters
     ----------
     files : list[str]
-        Paths to .npy files of shape (C, T)
+        Paths to .npy files of shape (..., T)
     window_length : int
         Length of each window in samples
     stride : int
@@ -218,31 +310,38 @@ class MEGDataset(Dataset):
     """
     def __init__(
         self,
-        files,
-        window_length,
-        stride,
-        crop_lengths,
+        files=None,
+        window_length=None,
+        stride=None,
+        crop_lengths=None,
         n_local_crops=2,
+        local_crop_length=None,
         weak_transform=None,
         strong_transform=None,
+        arrays=None,
+        temporal_neighbor=False,
     ):
-        self.files = files
+        if arrays is not None:
+            self.data = list(arrays)
+        elif files is not None:
+            self.data = [np.load(f) for f in files]
+        else:
+            raise ValueError("Either files or arrays must be provided")
+
         self.window_length = int(window_length)
         self.stride = int(stride)
         self.crop_lengths = list(crop_lengths)
         self.n_local_crops = int(n_local_crops)
+        self.local_crop_length = int(local_crop_length) if local_crop_length is not None else min(self.crop_lengths)
         self.weak_transform = weak_transform
         self.strong_transform = strong_transform
-
-        # load data into memory (recommended)
-        self.data = [np.load(f) for f in self.files]
+        self.temporal_neighbor = temporal_neighbor
 
         # precompute window indices: (file_id, start)
         self.windows = []
         for file_id, arr in enumerate(self.data):
-            C, T = arr.shape
+            T = arr.shape[-1]
             if T < self.window_length:
-                # pad-short recordings to one window
                 self.windows.append((file_id, 0))
             else:
                 starts = list(range(0, T - self.window_length + 1, self.stride))
@@ -253,17 +352,17 @@ class MEGDataset(Dataset):
         return len(self.windows)
 
     def _random_crop(self, arr, L):
-        _, T = arr.shape
+        T = arr.shape[-1]
         if T <= L:
-            pad = L - T
-            arr = np.pad(arr, ((0,0),(0,pad)), mode="constant")
-            return arr[:, :L].astype(np.float32)
+            pad_width = [(0, 0)] * (arr.ndim - 1) + [(0, L - T)]
+            arr = np.pad(arr, pad_width, mode="constant")
+            return arr[..., :L].astype(np.float32)
         start = random.randint(0, T - L)
-        return arr[:, start:start+L].astype(np.float32)
+        return arr[..., start:start+L].astype(np.float32)
 
     def __getitem__(self, idx):
         file_id, start = self.windows[idx]
-        arr = self.data[file_id][:, start:start + self.window_length]  # (C, window_length)
+        arr = self.data[file_id][..., start:start + self.window_length]
 
         views = []
 
@@ -275,11 +374,30 @@ class MEGDataset(Dataset):
             views.append(torch.from_numpy(crop).float())
 
         # local crops (strong)
-        smallest = min(self.crop_lengths)
         for _ in range(self.n_local_crops):
-            crop = self._random_crop(arr, smallest)
+            crop = self._random_crop(arr, self.local_crop_length)
             if self.strong_transform:
                 crop = self.strong_transform(crop)
+            views.append(torch.from_numpy(crop).float())
+
+        # temporal neighbor crop (weak) — from adjacent window in same file
+        if self.temporal_neighbor:
+            neighbor_idx = None
+            if idx + 1 < len(self.windows) and self.windows[idx + 1][0] == file_id:
+                neighbor_idx = idx + 1
+            elif idx - 1 >= 0 and self.windows[idx - 1][0] == file_id:
+                neighbor_idx = idx - 1
+
+            if neighbor_idx is not None:
+                nf, ns = self.windows[neighbor_idx]
+                neighbor_arr = self.data[nf][..., ns:ns + self.window_length]
+            else:
+                # No adjacent window in same file — use self with different crop
+                neighbor_arr = arr
+
+            crop = self._random_crop(neighbor_arr, self.crop_lengths[0])
+            if self.weak_transform:
+                crop = self.weak_transform(crop)
             views.append(torch.from_numpy(crop).float())
 
         return views
