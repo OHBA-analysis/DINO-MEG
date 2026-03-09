@@ -47,9 +47,10 @@ exp_motif_1ch/    # Single-channel oscillatory motif detection (1D conv, ConvNet
   supervised_sanity.py  # Supervised baseline
 
 exp_real_meg/     # Real MEG experiment on Cam-CAN parcellated data (ConvNetV2 + conditioning)
-  train.py        # DINO with channel/subject identity embeddings
+  train.py        # DINO with channel/subject identity embeddings, GPU augmentation
   diagnose.py     # Training curves, PCA/t-SNE scatter plots, eigenspectrum, embedding viz
   analyse.py      # Attention maps, NN retrieval, motif discovery, age correlation
+  interpret.py    # Stem filter viz, per-motif PSD, optimal input synthesis, gradient saliency
 
 envs/
   torch.yml       # Conda environment spec
@@ -77,7 +78,7 @@ Linear(feat_dim -> hidden_dim) -> GELU -> Linear(hidden_dim -> out_dim)
 
 ### Student-teacher (`DINOModel`)
 
-- **Teacher**: EMA copy of the student; no gradients; momentum annealed from 0.996 -> 1.0 via cosine schedule.
+- **Teacher**: EMA copy of the student; no gradients; momentum annealed from 0.996 -> 1.0 (small datasets) or 0.9999 -> 1.0 (full Cam-CAN) via cosine schedule.
 - Both student and teacher share the same `backbone + projector` architecture. Output is L2-normalised.
 
 ### Conditioned model (`ConditionedDINOModel`, in `exp_real_meg/train.py`)
@@ -119,12 +120,15 @@ The center is updated each step as an EMA of teacher outputs (momentum 0.9).
 | Global crop size | 28 px | 1000 samples | 112 samples | 112 samples |
 | Local crop size | 14 px | 500 samples | 100 samples | 100 samples |
 | Batch size | 512 | 32 | 256 | 2048 |
-| Learning rate | 3e-4 | 5e-4 | 5e-4 | 1e-3 |
-| Teacher momentum | 0.996 | 0.996 | 0.996 | 0.9998 |
+| Learning rate | 3e-4 | 5e-4 | 5e-4 | 2e-4 |
+| Teacher momentum | 0.996 | 0.996 | 0.996 | 0.9999 |
+| Warmup epochs | 3 | 3 | 3 | 15 |
 | Student temp | 0.1 | 0.1 | 0.1 | 0.05 |
+| Grad clip norm | 1.0 | 1.0 | 1.0 | 0.3 |
 | AMP | enabled | enabled | enabled | enabled |
+| Augmentation | CPU | CPU | CPU | GPU batch |
 
-**Note on teacher momentum scaling**: With larger datasets (more steps per epoch), teacher momentum must be increased to prevent the teacher from being fully replaced each epoch. For real MEG with ~1400 steps/epoch, `0.9998` provides equivalent per-epoch teacher retention to `0.996` with ~80 steps/epoch.
+**Note on real MEG scaling**: With 612 subjects (4210 steps/epoch), the per-epoch learning is ~15x more than smaller experiments. This requires lower LR (2e-4), higher teacher momentum (0.9999), longer warmup (15 epochs), and tighter gradient clipping (0.3). Augmentations are applied on GPU in batch to avoid CPU data-loading bottlenecks — this achieves 96% GPU utilization vs ~20% with CPU-based augmentation.
 
 ### Evaluation
 
@@ -170,23 +174,40 @@ Single-channel validation using ConvNetV2. Simulates Markov-switched oscillatory
 ### Real MEG (Cam-CAN parcellated data)
 
 ```bash
-python exp_real_meg/train.py
+CUDA_VISIBLE_DEVICES=1 python exp_real_meg/train.py   # ~5 hours on V100-32GB
 python exp_real_meg/diagnose.py
 python exp_real_meg/analyse.py
+python exp_real_meg/interpret.py
 ```
 
-Applies DINO to real Cam-CAN source-reconstructed MEG data (52 parcels per subject). Each parcel channel is treated as an independent (1, T) stream. Channel and subject identity embeddings are concatenated to backbone features before the projector.
+Applies DINO to real Cam-CAN source-reconstructed MEG data (612 subjects, 52 parcels each). Each parcel channel is treated as an independent (1, T) stream. Channel and subject identity embeddings are concatenated to backbone features before the projector.
 
 **Data**: `/well/win-camcan/shared/spring23/src/sub-*/sflip_parc-raw.fif`
 
-**Analyses include**:
+**Training pipeline**:
+- Pre-extracts all windows into a single contiguous tensor (~5 GB, 8.6M windows)
+- GPU-based batch augmentation (noise, baseline shift, scaling, time masking, sign flip)
+- TensorDataset with pre-computed channel/subject IDs for zero-overhead conditioning lookup
+- 30 epochs, ~10 min/epoch, final loss=0.31, feature effective rank=37
+
+**Analyses** (`analyse.py`):
 - Temporal attention maps by brain region
 - Nearest-neighbour retrieval (within and across subjects)
 - Motif discovery: k-means clustering with average waveform visualization
 - Per-subject motif frequency heatmap
 - Age correlation of motif frequencies and PCA features (using `participants.tsv`)
 - Channel and subject similarity matrices with hierarchical clustering
-- Cross-subject consistency analysis
+
+**Interpretability** (`interpret.py`):
+- Stem filter waveforms and frequency responses (3 branches x 32 filters)
+- Maximally activating windows per filter
+- Per-motif spectral analysis (Welch PSD)
+- Optimal input synthesis via gradient ascent
+- Input gradient saliency in frequency domain
+- Feature ablation by stem branch
+- Stem branch activation per motif
+- Feature-frequency correlation heatmap
+- Motif temporal context (burstiness)
 
 ---
 

@@ -59,9 +59,10 @@ exp_motif_1ch/    # Single-channel oscillatory motif detection (1D conv, ConvNet
   figures/
 
 exp_real_meg/     # Real MEG experiment on Cam-CAN parcellated data (ConvNetV2 + conditioning)
-  train.py        # DINO with channel/subject identity embeddings (ConditionedDINOModel)
+  train.py        # DINO with channel/subject identity embeddings, GPU augmentation, pre-extracted windows
   diagnose.py     # Training curves, PCA/t-SNE scatter plots, eigenspectrum, embedding viz
   analyse.py      # Attention maps, NN retrieval, motif discovery, per-subject frequency, age correlation
+  interpret.py    # Stem filter viz, per-motif PSD, optimal input synthesis, gradient saliency, branch ablation
   checkpoints/
   figures/
 
@@ -78,14 +79,14 @@ New experiments follow the `exp_<name>/` pattern with their own `train.py`, `dat
 - **Projector**: 2-layer MLP -> `out_dim` (4096 for motif/real MEG, 8192 for HMM-MVN, 2048 for MNIST)
 - **DINOModel**: backbone + projector + optional predictor; output is L2-normalised
 - **ConditionedDINOModel** (exp_real_meg): backbone + channel/subject embeddings concatenated before projector
-- **Teacher**: EMA copy of student (no grad); momentum annealed 0.996 -> 1.0 (or 0.9998 -> 1.0 for large datasets)
+- **Teacher**: EMA copy of student (no grad); momentum annealed 0.996 -> 1.0 (or 0.9999 -> 1.0 for full Cam-CAN)
 
 ## Training
 
 - Loss: cross-entropy between centered teacher softmax and student log-softmax
 - Center: EMA-updated from teacher outputs (momentum 0.9)
 - LR: linear warmup + cosine decay; AdamW with weight decay (bias/norm layers excluded)
-- AMP (autocast + GradScaler), gradient clip norm = 1.0
+- AMP (autocast + GradScaler), gradient clip norm = 1.0 (0.3 for full Cam-CAN)
 - Evaluation: k-NN on backbone features (cosine similarity) every N epochs (where labels available)
 - Real MEG (no labels): monitor loss, grad_norm, center_norm, feature effective rank
 

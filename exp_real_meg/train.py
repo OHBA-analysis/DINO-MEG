@@ -21,21 +21,20 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from copy import deepcopy
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
 
 torch.multiprocessing.set_sharing_strategy("file_system")
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
-from modules.data import Transforms, MEGDataset
+from modules.data import Transforms  # only used as reference; GPU augmentation below
 from modules.model import ConvNetV2, Projector
 from modules.trainer import (
     DINOLoss,
     param_groups_lrd,
     linear_warmup_cosine_decay,
     momentum_update,
-    prepare_view_tensors,
 )
 
 # ----------
@@ -48,18 +47,18 @@ METRICS_FILE = os.path.join(CKPT_DIR, "metrics.json")
 os.makedirs(CKPT_DIR, exist_ok=True)
 
 # How many subjects to use (None = all available)
-max_subjects = 50
+max_subjects = None  # all available (~644)
 
 n_channels = 1  # each parcel channel treated independently
 n_parcels = 52
 sampling_frequency = 250
 window_length = 150
-stride = 125
+stride = 500
 crop_lengths = [112, 112]
 local_crop_length = 100
 n_local_crops = 2
 
-epochs = 20
+epochs = 30
 batch_size = 2048
 feat_dim = 256
 emb_dim = 32
@@ -68,20 +67,20 @@ hidden_dim = 512
 out_dim = 4096
 use_predictor = False
 
-lr = 1e-3
+lr = 2e-4
 lr_start = 1e-6
 lr_final_scale = 0.01
-warmup_epochs = 3
-weight_decay = 0.05
-teacher_momentum = 0.9998
+warmup_epochs = 15
+weight_decay = 0.04
+teacher_momentum = 0.9999
 teacher_momentum_final = 1.0
 teacher_temp = 0.04
 teacher_temp_final = 0.02
-teacher_temp_warmup_epochs = 5
+teacher_temp_warmup_epochs = 15
 student_temp = 0.05
 center_momentum = 0.9
-grad_clip_norm = 1.0
-save_every = 2
+grad_clip_norm = 0.3
+save_every = 5
 
 # ConvNetV2 params
 v2_stem_channels = 32
@@ -198,83 +197,115 @@ print(f"Metadata saved to {CKPT_DIR}/metadata.json")
 
 
 # --------------------------------
-# Dataset with conditioning info
+# GPU batch augmentation
 # --------------------------------
 
-weak_transform = Transforms(
-    sampling_frequency=sampling_frequency,
-    add_noise_p=0.8,
-    noise_std=0.10,
-    baseline_shift_p=0.3,
-    baseline_shift_std=0.03,
-    scale_p=0.5,
-    scale_sigma=0.10,
-    amplitude_warp_p=0.3,
-    warp_max=0.04,
-    time_mask_p=0.5,
-    time_mask_ratio=0.06,
-    time_mask_n=1,
-    channel_mask_p=0.0,
-    notch_p=0.0,
-    time_reverse_p=0.0,
-    sign_flip_p=0.3,
+def gpu_augment(x, noise_std=0.10, noise_p=0.8,
+                baseline_shift_std=0.03, baseline_shift_p=0.3,
+                scale_sigma=0.10, scale_p=0.5,
+                time_mask_ratio=0.06, time_mask_p=0.5, time_mask_n=1,
+                sign_flip_p=0.3):
+    """Apply augmentations to a batch on GPU. x: (B, 1, L)."""
+    B, C, L = x.shape
+
+    # Gaussian noise
+    mask = (torch.rand(B, 1, 1, device=x.device) < noise_p).float()
+    x = x + mask * torch.randn_like(x) * noise_std
+
+    # Baseline shift
+    mask = (torch.rand(B, 1, 1, device=x.device) < baseline_shift_p).float()
+    x = x + mask * torch.randn(B, C, 1, device=x.device) * baseline_shift_std
+
+    # Amplitude scaling
+    mask = (torch.rand(B, 1, 1, device=x.device) < scale_p).float()
+    scales = 1.0 + mask * torch.randn(B, C, 1, device=x.device) * scale_sigma
+    x = x * scales
+
+    # Time masking
+    for _ in range(time_mask_n):
+        do_mask = torch.rand(B, device=x.device) < time_mask_p  # (B,)
+        mask_len = int(L * time_mask_ratio)
+        if mask_len > 0:
+            starts = torch.randint(0, max(1, L - mask_len), (B,), device=x.device)
+            # Create mask: 1 everywhere, 0 in masked region
+            t = torch.arange(L, device=x.device).unsqueeze(0)  # (1, L)
+            tmask = ~((t >= starts.unsqueeze(1)) & (t < (starts + mask_len).unsqueeze(1)))
+            tmask = tmask.unsqueeze(1).float()  # (B, 1, L)
+            # Only apply to selected samples
+            tmask = torch.where(do_mask.view(B, 1, 1), tmask, torch.ones_like(tmask))
+            x = x * tmask
+
+    # Sign flip
+    mask = (torch.rand(B, 1, 1, device=x.device) < sign_flip_p).float()
+    x = x * (1.0 - 2.0 * mask)
+
+    return x
+
+
+def random_crop_batch(windows, crop_length):
+    """Random crop a batch of windows. windows: (B, 1, W) -> (B, 1, crop_length)."""
+    B, C, W = windows.shape
+    if W <= crop_length:
+        return F.pad(windows, (0, crop_length - W))
+    max_start = W - crop_length
+    starts = torch.randint(0, max_start + 1, (B,), device=windows.device)
+    # Gather crops using advanced indexing
+    t = torch.arange(crop_length, device=windows.device).unsqueeze(0) + starts.unsqueeze(1)  # (B, crop_length)
+    return windows[:, :, :].gather(2, t.unsqueeze(1).expand(B, C, crop_length))
+
+
+# --------------------------------
+# Dataset (returns raw windows, no augmentation)
+# --------------------------------
+
+# Pre-extract all windows into a single contiguous array
+print("Pre-extracting windows...")
+all_windows = []
+all_file_ids = []
+for file_id, arr in enumerate(arrays):
+    T = arr.shape[-1]
+    if T < window_length:
+        all_windows.append(arr[:, :window_length] if T >= window_length else
+                          np.pad(arr, [(0,0),(0, window_length - T)]))
+        all_file_ids.append(file_id)
+    else:
+        starts = range(0, T - window_length + 1, stride)
+        for s in starts:
+            all_windows.append(arr[:, s:s + window_length])
+            all_file_ids.append(file_id)
+
+# Convert to torch tensors for fast DataLoader
+windows_tensor = torch.from_numpy(
+    np.stack(all_windows, axis=0).astype(np.float32)
+)  # (N, 1, window_length)
+file_ids_tensor = torch.from_numpy(
+    np.array(all_file_ids, dtype=np.int64)
+)  # (N,)
+del all_windows, all_file_ids, arrays
+print(f"  Pre-extracted {len(windows_tensor)} windows, shape {windows_tensor.shape}, "
+      f"size {windows_tensor.nelement() * 4 / 1e9:.1f} GB")
+
+# Pre-compute channel and subject IDs per window for fast GPU lookup
+channel_ids_all = torch.tensor(
+    [metadata[int(fid)]["channel_idx"] for fid in file_ids_tensor.numpy()],
+    dtype=torch.long,
 )
-strong_transform = Transforms(
-    sampling_frequency=sampling_frequency,
-    add_noise_p=0.95,
-    noise_std=0.15,
-    baseline_shift_p=0.4,
-    baseline_shift_std=0.05,
-    scale_p=0.6,
-    scale_sigma=0.15,
-    amplitude_warp_p=0.6,
-    warp_max=0.05,
-    time_mask_p=0.8,
-    time_mask_ratio=0.08,
-    time_mask_n=2,
-    channel_mask_p=0.0,
-    notch_p=0.0,
-    time_reverse_p=0.0,
-    sign_flip_p=0.3,
+subject_ids_all = torch.tensor(
+    [metadata[int(fid)]["subject_idx"] for fid in file_ids_tensor.numpy()],
+    dtype=torch.long,
 )
+del file_ids_tensor  # no longer needed
 
-
-class ConditionedMEGDataset(MEGDataset):
-    """MEGDataset subclass that also returns file_id for conditioning lookup."""
-
-    def __getitem__(self, idx):
-        views = super().__getitem__(idx)
-        file_id, _ = self.windows[idx]
-        return views, file_id
-
-
-def conditioned_collate(batch):
-    """Custom collate: separate views and file_ids."""
-    views_list = [item[0] for item in batch]
-    file_ids = [item[1] for item in batch]
-    return views_list, file_ids
-
-
-dataset = ConditionedMEGDataset(
-    arrays=arrays,
-    window_length=window_length,
-    stride=stride,
-    crop_lengths=crop_lengths,
-    n_local_crops=n_local_crops,
-    local_crop_length=local_crop_length,
-    weak_transform=weak_transform,
-    strong_transform=strong_transform,
-)
-# Free raw arrays (data is already copied into dataset.data)
-del arrays
+dataset = torch.utils.data.TensorDataset(windows_tensor, channel_ids_all, subject_ids_all)
 
 dl = DataLoader(
     dataset,
     batch_size=batch_size,
     shuffle=True,
-    num_workers=16,
+    num_workers=8,
     pin_memory=True,
-    collate_fn=conditioned_collate,
+    persistent_workers=True,
+    prefetch_factor=4,
 )
 
 n_iter_per_epoch = len(dl)
@@ -389,23 +420,35 @@ for epoch in pbar:
     running_grad_norm = 0.0
     epoch_feats = []
 
-    for it, (views_list, file_ids) in enumerate(dl):
+    for it, (windows_batch, channel_ids, subject_ids) in enumerate(dl):
         # Update LR
         for pg in opt.param_groups:
             pg["lr"] = lr_schedule[step]
 
-        # Prepare view tensors: list of (B, 1, L)
-        view_tensors = prepare_view_tensors(views_list, device)
+        # Move raw windows + IDs to GPU
+        windows_batch = windows_batch.to(device, non_blocking=True)
+        channel_ids = channel_ids.to(device, non_blocking=True)
+        subject_ids = subject_ids.to(device, non_blocking=True)
 
-        # Prepare conditioning tensors
-        channel_ids = torch.tensor(
-            [metadata[fid]["channel_idx"] for fid in file_ids],
-            dtype=torch.long, device=device,
-        )
-        subject_ids = torch.tensor(
-            [metadata[fid]["subject_idx"] for fid in file_ids],
-            dtype=torch.long, device=device,
-        )
+        # Create augmented views on GPU + forward pass (all under AMP)
+        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            view_tensors = []
+            for L in crop_lengths:
+                crop = random_crop_batch(windows_batch, L)
+                crop = gpu_augment(crop, noise_std=0.10, noise_p=0.8,
+                                 baseline_shift_std=0.03, baseline_shift_p=0.3,
+                                 scale_sigma=0.10, scale_p=0.5,
+                                 time_mask_ratio=0.06, time_mask_p=0.5, time_mask_n=1,
+                                 sign_flip_p=0.3)
+                view_tensors.append(crop)
+            for _ in range(n_local_crops):
+                crop = random_crop_batch(windows_batch, local_crop_length)
+                crop = gpu_augment(crop, noise_std=0.15, noise_p=0.95,
+                                 baseline_shift_std=0.05, baseline_shift_p=0.4,
+                                 scale_sigma=0.15, scale_p=0.6,
+                                 time_mask_ratio=0.08, time_mask_p=0.8, time_mask_n=2,
+                                 sign_flip_p=0.3)
+                view_tensors.append(crop)
 
         # Forward student with AMP
         with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
