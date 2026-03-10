@@ -88,6 +88,7 @@ v2_stem_kernel_sizes = (7, 15, 31)
 v2_block_channels = (128, 256)
 v2_block_kernel_sizes = (9, 5)
 v2_attn_hidden = 64
+use_amp = False  # disabled: float16 causes gradient overflow on this dataset
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"Device: {device}")
@@ -404,7 +405,7 @@ def compute_effective_rank(feats):
 # Training loop
 # --------------------------------
 
-scaler = torch.amp.GradScaler("cuda", enabled=(device.type == "cuda"))
+scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
 metrics = []
 step = 0
 
@@ -431,7 +432,7 @@ for epoch in pbar:
         subject_ids = subject_ids.to(device, non_blocking=True)
 
         # Create augmented views on GPU + forward pass (all under AMP)
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             view_tensors = []
             for L in crop_lengths:
                 crop = random_crop_batch(windows_batch, L)
@@ -451,7 +452,7 @@ for epoch in pbar:
                 view_tensors.append(crop)
 
         # Forward student with AMP
-        with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+        with torch.amp.autocast("cuda", enabled=use_amp):
             student_outputs = []
             for vt in view_tensors:
                 out = student(vt, channel_ids, subject_ids)
@@ -459,7 +460,7 @@ for epoch in pbar:
 
         # Forward teacher (no grad)
         with torch.no_grad():
-            with torch.amp.autocast("cuda", enabled=(device.type == "cuda")):
+            with torch.amp.autocast("cuda", enabled=use_amp):
                 teacher_outputs = []
                 for gi in global_teacher_view_idxs:
                     out = teacher(view_tensors[gi], channel_ids, subject_ids)

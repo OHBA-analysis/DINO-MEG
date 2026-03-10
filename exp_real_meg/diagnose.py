@@ -81,10 +81,21 @@ axes[0, 0].set_xlabel("Epoch")
 axes[0, 0].set_ylabel("Loss")
 axes[0, 0].set_title("DINO loss")
 
-axes[0, 1].plot(epochs_list, grad_norms, linewidth=0.8, color="darkorange")
+# Replace Inf with NaN for plotting
+grad_norms_plot = [g if np.isfinite(g) else np.nan for g in grad_norms]
+axes[0, 1].plot(epochs_list, grad_norms_plot, linewidth=0.8, color="darkorange")
+# Mark epochs with Inf gradient
+inf_epochs = [e for e, g in zip(epochs_list, grad_norms) if not np.isfinite(g)]
+if inf_epochs:
+    axes[0, 1].axhspan(axes[0, 1].get_ylim()[0], axes[0, 1].get_ylim()[1],
+                        alpha=0.0)  # force axis range
+    for ie in inf_epochs:
+        axes[0, 1].axvline(ie, color="red", alpha=0.15, linewidth=1)
+    axes[0, 1].set_title(f"Mean gradient norm ({len(inf_epochs)} epochs had Inf)")
+else:
+    axes[0, 1].set_title("Mean gradient norm")
 axes[0, 1].set_xlabel("Epoch")
 axes[0, 1].set_ylabel("Gradient norm")
-axes[0, 1].set_title("Mean gradient norm")
 
 axes[1, 0].plot(epochs_list, center_norms, linewidth=0.8, color="green")
 axes[1, 0].set_xlabel("Epoch")
